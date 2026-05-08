@@ -2,8 +2,13 @@
 
 这个工作区提供一个可直接调试的 `demo.py`，核心流程是：
 
-- 输入一个文件夹，文件夹内可以是若干图片、若干视频，也可以图片和视频混合。
-- 视频默认每秒抽取 1 帧。
+- 输入既可以是单张图片、单个视频，也可以是一个包含图片和视频的文件夹。
+- 运行时必须明确指定 `--task`，并且同一次运行只能启动一个功能。
+- `compress_restore`：只做压缩与还原。
+- `deblur_select`：只做视频选帧与去模糊。
+- 单张图片会直接进入单帧处理模式。
+- 单个视频会进入交互式选帧界面，通过按键挑选要保存和处理的帧。
+- 输入文件夹时会走批处理模式，自动扫描其中的图片和视频。
 - 输出目录保持输入文件夹的目录层级；每张图片或每个视频都会有自己的输出目录。
 - 图片输出 `original_4k.jpg`、`compressed_2k.jpg`、`restored_4k.jpg`。
 - 视频的所有抽帧结果保存在同一个视频目录中，通过文件名中的帧号区分。
@@ -20,39 +25,39 @@
 ```text
 demo.py        # 命令行入口，只负责解析参数和启动流程
 algorithms.py  # 算法模块：压缩还原、指标计算、去模糊接口
-io_control.py  # 输入输出控制：目录扫描、文件保存、批处理、报告输出
+io_control.py  # 输入输出控制：单图、单视频交互、目录批处理、文件保存、报告输出
 ```
 
 ## 运行示例
 
+处理单张图片：
+
+```bash
+python3 demo.py --task compress_restore --input /path/to/image_4k.jpg --output outputs/image_test --deblur-mode none
+```
+
+处理单个视频并进入交互式选帧：
+
+```bash
+python3 demo.py --task deblur_select --input /path/to/video_4k.mp4 --output outputs/video_ui_test --preview-scale 0.5 --video-seek-step 1 --deblur-mode unsharp
+```
+
 处理一个输入文件夹：
 
 ```bash
-python3 demo.py --input /path/to/input_folder --output outputs/batch_test
+python3 demo.py --task compress_restore --input /path/to/input_folder --output outputs/batch_test --deblur-mode none
 ```
 
 文件夹内的视频默认每秒抽取 1 帧：
 
 ```bash
-python3 demo.py --input /path/to/input_folder --output outputs/batch_test --sample-fps 1
+python3 demo.py --task compress_restore --input /path/to/input_folder --output outputs/batch_test --sample-fps 1 --deblur-mode none
 ```
 
 每个视频只调试前 5 个抽帧样本：
 
 ```bash
-python3 demo.py --input /path/to/input_folder --output outputs/batch_test --max-samples 5
-```
-
-开启轻量去模糊后处理：
-
-```bash
-python3 demo.py --input /path/to/input_folder --output outputs/deblur_test --deblur-mode unsharp --max-samples 5
-```
-
-调试传统 Wiener 运动去卷积：
-
-```bash
-python3 demo.py --input /path/to/input_folder --output outputs/wiener_test --deblur-mode wiener --motion-length 21 --motion-angle 0 --wiener-noise 0.02
+python3 demo.py --task compress_restore --input /path/to/input_folder --output outputs/batch_test --max-samples 5 --deblur-mode none
 ```
 
 ## 输出结构
@@ -92,6 +97,25 @@ outputs/
 deblurred_4k.jpg
 frame_000000_t0000.000s__deblurred_4k.jpg
 ```
+
+交互式去模糊模式还会额外输出：
+
+```text
+deblur_selection.csv
+deblur_selection.json
+frame_000000_t0000.000s__selected.jpg
+frame_000000_t0000.000s__deblurred.jpg
+frame_000000_t0000.000s__deblur_metrics.json
+```
+
+## 视频交互模式按键
+
+- `a / d`：按当前步长前后移动
+- `j / l`：快速大步前后跳
+- `- / +`：减小或增大步长
+- `space`：播放 / 暂停
+- `s`：保存当前帧，并执行压缩、还原、去模糊
+- `q`：退出交互界面
 
 ## 算法说明
 

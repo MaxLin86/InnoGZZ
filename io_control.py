@@ -1,4 +1,4 @@
-"""输入输出与流程控制模块：目录扫描、文件保存、批处理和报告输出。"""
+"""输入输出与流程控制模块：目录扫描、文件保存、批处理、单图模式和交互式视频模式。"""
 
 import argparse
 import csv
@@ -79,6 +79,24 @@ class SampleMetrics:
     psnr_deblurred: Optional[float] = None
     ssim_deblurred: Optional[float] = None
     blur_laplacian_var_deblurred: Optional[float] = None
+
+
+@dataclass
+class DeblurSelectionRecord:
+    """交互式选帧去模糊模式下的单帧记录。"""
+
+    sample_id: str
+    source_path: str
+    frame_index: int
+    timestamp_sec: float
+    width: int
+    height: int
+    deblur_mode: str
+    original_jpg_bytes: int
+    deblurred_jpg_bytes: int
+    blur_score_original: float
+    blur_score_deblurred: float
+    blur_score_gain: float
 
 
 SUMMARY_FIELDS = [
@@ -199,6 +217,12 @@ def output_dir_for_media(output_dir: Path, input_dir: Path, media_path: Path) ->
     return output_dir / relative_without_suffix
 
 
+def output_dir_for_single_file(output_dir: Path, input_path: Path) -> Path:
+    """为单图或单视频输入生成输出目录。"""
+
+    return output_dir / input_path.stem
+
+
 def prefixed_name(prefix: str, filename: str) -> str:
     """给视频帧输出文件加帧号前缀；图片输出则保持固定文件名。"""
 
@@ -225,37 +249,39 @@ def process_sample(
     compressed_bgr = resize_by_scale(image_bgr, args.compression_scale)
     compressed_height, compressed_width = compressed_bgr.shape[:2]
 
-    # 2. 再把 2K 压缩表示还原回原始尺寸，便于和原图做质量对比。
+    # 2. 准备输出路径：原图 JPEG、2K 压缩 JPEG、4K 还原 JPEG。
+    original_path = sample_dir / prefixed_name(filename_prefix, "original_4k.jpg")
+    compressed_path = sample_dir / prefixed_name(filename_prefix, "compressed_2k.jpg")
+    restored_path = sample_dir / prefixed_name(filename_prefix, "restored_4k.jpg")
+    
+    # 3-1. 保存原图 JPEG、2K 压缩 JPEG
+    original_size = save_jpeg(original_path, image_bgr, args.original_quality)
+    compressed_size = save_jpeg(compressed_path, compressed_bgr, args.compressed_quality)
+    
+    # 3-2. 重新读取压缩图，并且还原到原图大小。
+    reload_compressed_bgr = cv2.imread(compressed_path)
     restored_bgr = restore_to_size(
-        compressed_bgr,
+        reload_compressed_bgr,
         target_size=(width, height),
         sharpen_amount=args.restore_sharpen,
         detail_enhance=args.detail_enhance,
     )
-
-    # 3. 保存三类核心输出：原图 JPEG、2K 压缩 JPEG、4K 还原 JPEG。
-    original_path = sample_dir / prefixed_name(filename_prefix, "original_4k.jpg")
-    compressed_path = sample_dir / prefixed_name(filename_prefix, "compressed_2k.jpg")
-    restored_path = sample_dir / prefixed_name(filename_prefix, "restored_4k.jpg")
-
-    original_size = save_jpeg(original_path, image_bgr, args.original_quality)
-    compressed_size = save_jpeg(compressed_path, compressed_bgr, args.compressed_quality)
     restored_size = save_jpeg(restored_path, restored_bgr, args.restored_quality)
 
+    # 4. 压缩还原模式默认不做去模糊；只有显式启用时才额外输出 deblurred_4k.jpg。
     deblurred_size = None
     psnr_deblurred = None
     ssim_deblurred = None
     blur_deblurred = None
-
-    # 4. 去模糊是可选调试接口，默认不启用；启用后额外输出 deblurred_4k.jpg。
-    deblur_processor = DeblurProcessor(
-        mode=args.deblur_mode,
-        motion_length=args.motion_length,
-        motion_angle=args.motion_angle,
-        wiener_noise=args.wiener_noise,
-        unsharp_amount=args.deblur_unsharp,
-    )
-    if args.deblur_mode != "none":
+    deblur_mode = getattr(args, "deblur_mode", "none")
+    if deblur_mode != "none":
+        deblur_processor = DeblurProcessor(
+            mode=deblur_mode,
+            motion_length=args.motion_length,
+            motion_angle=args.motion_angle,
+            wiener_noise=args.wiener_noise,
+            unsharp_amount=args.deblur_unsharp,
+        )
         deblurred_bgr = deblur_processor.apply(restored_bgr)
         deblurred_path = sample_dir / prefixed_name(filename_prefix, "deblurred_4k.jpg")
         deblurred_size = save_jpeg(deblurred_path, deblurred_bgr, args.restored_quality)
@@ -286,7 +312,7 @@ def process_sample(
         ssim_restored=ssim_score(image_bgr, restored_bgr),
         blur_laplacian_var_original=blur_laplacian_var(image_bgr),
         blur_laplacian_var_restored=blur_laplacian_var(restored_bgr),
-        deblur_mode=args.deblur_mode,
+        deblur_mode=deblur_mode,
         deblurred_jpg_bytes=deblurred_size,
         psnr_deblurred=psnr_deblurred,
         ssim_deblurred=ssim_deblurred,
@@ -303,6 +329,13 @@ def write_sample_metadata(path: Path, metrics: SampleMetrics) -> None:
     data = asdict(metrics)
     with path.open("w", encoding="utf-8") as handle:
         json.dump(data, handle, indent=2, ensure_ascii=False)
+
+
+def write_deblur_selection_metadata(path: Path, record: DeblurSelectionRecord) -> None:
+    """把交互式去模糊单帧记录写到当前样本目录下的 JSON 文件。"""
+
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(asdict(record), handle, indent=2, ensure_ascii=False)
 
 
 def average_optional(values: List[Optional[float]]) -> Optional[float]:
@@ -588,6 +621,22 @@ def process_image(
     ]
 
 
+def process_image_file(input_path: Path, output_dir: Path, args: argparse.Namespace) -> List[SampleMetrics]:
+    """单图模式：直接处理一张输入图像。"""
+
+    sample_dir = output_dir_for_single_file(output_dir, input_path)
+    sample_id = input_path.stem
+    return process_image(input_path, sample_dir, args, sample_id)
+
+
+def process_video_file(input_path: Path, output_dir: Path, args: argparse.Namespace) -> List[SampleMetrics]:
+    """单视频压缩还原模式：按固定抽帧策略处理一个视频文件。"""
+
+    sample_dir = output_dir_for_single_file(output_dir, input_path)
+    sample_id = input_path.stem
+    return process_video(input_path, sample_dir, args, sample_id)
+
+
 def iter_video_samples(
     input_path: Path,
     sample_fps: float,
@@ -658,6 +707,210 @@ def process_video(
             )
         )
     return metrics
+
+
+def resize_for_preview(frame_bgr: np.ndarray, preview_scale: float) -> np.ndarray:
+    """把预览帧缩放到适合交互窗口显示的尺寸。"""
+
+    if preview_scale <= 0:
+        preview_scale = 1.0
+    if abs(preview_scale - 1.0) < 1e-6:
+        return frame_bgr
+    height, width = frame_bgr.shape[:2]
+    preview_width = max(1, int(round(width * preview_scale)))
+    preview_height = max(1, int(round(height * preview_scale)))
+    return cv2.resize(frame_bgr, (preview_width, preview_height), interpolation=cv2.INTER_AREA)
+
+
+def overlay_preview_info(
+    frame_bgr: np.ndarray,
+    frame_index: int,
+    total_frames: int,
+    timestamp_sec: float,
+    blur_score: float,
+    step: int,
+    mode_text: str,
+) -> np.ndarray:
+    """在预览帧上叠加调试信息和按键提示。"""
+
+    preview = frame_bgr.copy()
+    lines = [
+        f"frame: {frame_index + 1}/{total_frames}",
+        f"time: {timestamp_sec:.3f}s",
+        f"blur_score: {blur_score:.2f}",
+        f"step: {step}",
+        f"mode: {mode_text}",
+        "keys: a/d move  j/l jump  -/+ step  space play/pause",
+        "keys: s save current frame  q quit",
+    ]
+    start_y = 28
+    for line in lines:
+        cv2.putText(preview, line, (16, start_y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(preview, line, (16, start_y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 1, cv2.LINE_AA)
+        start_y += 28
+    return preview
+
+
+def make_preview_panel(images: List[np.ndarray], max_height: int = 420) -> np.ndarray:
+    """把多张图拼成横向调试面板，便于观察去模糊前后差异。"""
+
+    panels = []
+    for image in images:
+        height, width = image.shape[:2]
+        scale = min(1.0, max_height / float(height))
+        target_size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
+        resized = cv2.resize(image, target_size, interpolation=cv2.INTER_AREA)
+        panels.append(resized)
+    return cv2.hconcat(panels)
+
+
+def process_video_interactive(
+    input_path: Path,
+    output_dir: Path,
+    args: argparse.Namespace,
+) -> List[DeblurSelectionRecord]:
+    """视频模式：打开交互式界面，通过按键选帧并保存处理结果。"""
+
+    sample_dir = output_dir_for_single_file(output_dir, input_path)
+    ensure_dir(sample_dir)
+
+    capture = cv2.VideoCapture(str(input_path))
+    if not capture.isOpened():
+        raise ValueError(f"Cannot open video: {input_path}")
+
+    source_fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+    if source_fps <= 0.0:
+        source_fps = 30.0
+    total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    frame_index = 0
+    step = max(1, int(getattr(args, "video_seek_step", 1)))
+    is_playing = False
+    saved_records: List[DeblurSelectionRecord] = []
+
+    window_name = "Video Frame Selector"
+    preview_name = "Processed Preview"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.namedWindow(preview_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, 1440, 900)
+    cv2.resizeWindow(preview_name, 1440, 520)
+
+    print(f"Interactive video mode: {input_path}")
+    print(f"Video info: total_frames={total_frames}, fps={source_fps:.3f}, default_step={step}")
+    print("Controls: a/d move, j/l jump, -/+ change step, space play/pause, s save frame, q quit")
+
+    def read_frame(target_index: int) -> Tuple[np.ndarray, float]:
+        bounded_index = max(0, min(target_index, max(total_frames - 1, 0)))
+        capture.set(cv2.CAP_PROP_POS_FRAMES, bounded_index)
+        ok, frame = capture.read()
+        if not ok or frame is None:
+            raise ValueError(f"Failed to read frame {bounded_index} from: {input_path}")
+        return frame, bounded_index / source_fps
+
+    try:
+        while True:
+            frame, timestamp_sec = read_frame(frame_index)
+            blur_score = blur_laplacian_var(frame)
+            preview_frame = resize_for_preview(frame, getattr(args, "preview_scale", 0.5))
+            overlay = overlay_preview_info(
+                preview_frame,
+                frame_index=frame_index,
+                total_frames=total_frames,
+                timestamp_sec=timestamp_sec,
+                blur_score=blur_score,
+                step=step,
+                mode_text="play" if is_playing else "pause",
+            )
+            cv2.imshow(window_name, overlay)
+
+            wait_ms = max(1, int(round(1000.0 / source_fps))) if is_playing else 0
+            key = cv2.waitKey(wait_ms) & 0xFF
+            if key == 255 and is_playing:
+                if frame_index < max(total_frames - 1, 0):
+                    frame_index += 1
+                continue
+
+            if key in (ord("q"), 27):
+                break
+            if key == ord(" "):
+                is_playing = not is_playing
+                continue
+            if key == ord("a"):
+                is_playing = False
+                frame_index = max(0, frame_index - step)
+                continue
+            if key == ord("d"):
+                is_playing = False
+                frame_index = min(max(total_frames - 1, 0), frame_index + step)
+                continue
+            if key == ord("j"):
+                is_playing = False
+                frame_index = max(0, frame_index - step * 10)
+                continue
+            if key == ord("l"):
+                is_playing = False
+                frame_index = min(max(total_frames - 1, 0), frame_index + step * 10)
+                continue
+            if key in (ord("-"), ord("_")):
+                step = max(1, step // 2)
+                continue
+            if key in (ord("="), ord("+")):
+                step = min(max(total_frames, 1), step * 2)
+                continue
+            if key == ord("s"):
+                is_playing = False
+                frame_sample_id = f"frame_{len(saved_records):06d}_t{timestamp_sec:08.3f}s"
+                original_path = sample_dir / prefixed_name(frame_sample_id, "selected.jpg")
+                deblurred_path = sample_dir / prefixed_name(frame_sample_id, "deblurred.jpg")
+                metadata_path = sample_dir / prefixed_name(frame_sample_id, "deblur_metrics.json")
+
+                deblur_processor = DeblurProcessor(
+                    mode=args.deblur_mode,
+                    motion_length=args.motion_length,
+                    motion_angle=args.motion_angle,
+                    wiener_noise=args.wiener_noise,
+                    unsharp_amount=args.deblur_unsharp,
+                )
+                deblurred_frame = deblur_processor.apply(frame)
+                original_size = save_jpeg(original_path, frame, args.selected_quality)
+                deblurred_size = save_jpeg(deblurred_path, deblurred_frame, args.deblurred_quality)
+
+                blur_score_deblurred = blur_laplacian_var(deblurred_frame)
+                record = DeblurSelectionRecord(
+                    sample_id=frame_sample_id,
+                    source_path=str(input_path),
+                    frame_index=frame_index,
+                    timestamp_sec=timestamp_sec,
+                    width=frame.shape[1],
+                    height=frame.shape[0],
+                    deblur_mode=args.deblur_mode,
+                    original_jpg_bytes=original_size,
+                    deblurred_jpg_bytes=deblurred_size,
+                    blur_score_original=blur_score,
+                    blur_score_deblurred=blur_score_deblurred,
+                    blur_score_gain=blur_score_deblurred - blur_score,
+                )
+                write_deblur_selection_metadata(metadata_path, record)
+                saved_records.append(record)
+
+                cv2.imshow(preview_name, make_preview_panel([frame, deblurred_frame]))
+                print(
+                    "Saved frame: "
+                    f"frame_index={frame_index}, "
+                    f"time={timestamp_sec:.3f}s, "
+                    f"blur_score={blur_score:.2f}, "
+                    f"deblurred_blur_score={blur_score_deblurred:.2f}, "
+                    f"output_prefix={frame_sample_id}"
+                )
+                continue
+    finally:
+        capture.release()
+        try:
+            cv2.destroyWindow(window_name)
+            cv2.destroyWindow(preview_name)
+        except cv2.error:
+            pass
+
+    return saved_records
 
 
 def process_input_directory(input_dir: Path, output_dir: Path, args: argparse.Namespace) -> List[SampleMetrics]:
@@ -744,16 +997,77 @@ def print_summary(summary: Dict[str, Any], output_dir: Path) -> None:
     print(f"Summary JSON: {output_dir / 'summary.json'}")
 
 
-def run_batch(input_path: Path, output_dir: Path, args: argparse.Namespace) -> List[SampleMetrics]:
-    """校验输入输出目录，执行批处理，并写出汇总报告。"""
+def write_deblur_selection_summary(output_dir: Path, records: List[DeblurSelectionRecord]) -> None:
+    """把交互式选帧去模糊结果写入单独的 CSV 和 JSON。"""
+
+    ensure_dir(output_dir)
+    json_path = output_dir / "deblur_selection.json"
+    csv_path = output_dir / "deblur_selection.csv"
+    fieldnames = [
+        "sample_id",
+        "source_path",
+        "frame_index",
+        "timestamp_sec",
+        "width",
+        "height",
+        "deblur_mode",
+        "original_jpg_bytes",
+        "deblurred_jpg_bytes",
+        "blur_score_original",
+        "blur_score_deblurred",
+        "blur_score_gain",
+    ]
+
+    with json_path.open("w", encoding="utf-8") as handle:
+        json.dump([asdict(record) for record in records], handle, indent=2, ensure_ascii=False)
+
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for record in records:
+            writer.writerow(asdict(record))
+
+
+def print_deblur_selection_summary(records: List[DeblurSelectionRecord], output_dir: Path) -> None:
+    """在终端打印交互式选帧去模糊结果摘要。"""
+
+    print(f"Output directory: {output_dir}")
+    print(f"Saved deblur frames: {len(records)}")
+    if records:
+        avg_gain = sum(record.blur_score_gain for record in records) / len(records)
+        print(f"Average blur-score gain: {avg_gain:.2f}")
+    print(f"Deblur selection CSV: {output_dir / 'deblur_selection.csv'}")
+    print(f"Deblur selection JSON: {output_dir / 'deblur_selection.json'}")
+
+
+def run_batch(input_path: Path, output_dir: Path, args: argparse.Namespace) -> List[Any]:
+    """校验输入路径，并按压缩还原或选帧去模糊两种任务执行。"""
 
     if not input_path.exists():
         raise FileNotFoundError(input_path)
-    if not input_path.is_dir():
-        raise NotADirectoryError(f"--input must be a directory: {input_path}")
 
     ensure_dir(output_dir)
-    metrics = process_input_directory(input_path, output_dir, args)
-    summary = write_summary(output_dir, metrics)
-    print_summary(summary, output_dir)
-    return metrics
+    if args.task == "compress_restore":
+        if input_path.is_dir():
+            metrics = process_input_directory(input_path, output_dir, args)
+        else:
+            input_kind = detect_input_kind(input_path)
+            if input_kind == "image":
+                metrics = process_image_file(input_path, output_dir, args)
+            else:
+                metrics = process_video_file(input_path, output_dir, args)
+        summary = write_summary(output_dir, metrics)
+        print_summary(summary, output_dir)
+        return metrics
+
+    if args.task == "deblur_select":
+        if input_path.is_dir():
+            raise ValueError("deblur_select mode only supports a single video file input.")
+        if detect_input_kind(input_path) != "video":
+            raise ValueError("deblur_select mode requires a video file input.")
+        records = process_video_interactive(input_path, output_dir, args)
+        write_deblur_selection_summary(output_dir, records)
+        print_deblur_selection_summary(records, output_dir)
+        return records
+
+    raise ValueError(f"Unsupported task: {args.task}")

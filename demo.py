@@ -3,59 +3,65 @@
 
 代码拆分：
   - algorithms.py：压缩还原、质量指标、运动模糊去除算法。
-  - io_control.py：输入目录扫描、输出保存、批处理流程和报告。
+  - io_control.py：输入输出控制、批处理流程、单图模式和交互式视频模式。
   - demo.py：只负责命令行参数和程序入口。
 """
 
 import argparse
+import sys
 from pathlib import Path
 
 from io_control import run_batch
 
 
-def build_arg_parser() -> argparse.ArgumentParser:
-    """定义命令行参数，便于独立调试压缩、还原和去模糊模块。"""
-
-    parser = argparse.ArgumentParser(
-        description="4K image/video compression, restoration, and deblur debug demo."
-    )
-    parser.add_argument("--input", required=True, help="Input directory containing images/videos.")
+def build_parser(task: str) -> argparse.ArgumentParser:
+    """根据任务类型构建参数解析器。"""
+    parser = argparse.ArgumentParser(description="4K image/video compression, restoration, and deblur debug demo.")
+    parser.add_argument("--task", required=True, choices=["compress_restore", "deblur_select"], help="Choose exactly one function: compression/restoration or frame-selection/deblur.")
+    parser.add_argument("--input", required=True, help="Input path for the selected task.")
     parser.add_argument("--output", default="outputs", help="Output directory.")
-    parser.add_argument(
-        "--compression-scale",
-        type=float,
-        default=0.5,
-        help="Resize scale for the compressed representation. 0.5 maps 4K UHD to 2K/FHD.",
-    )
-    parser.add_argument("--original-quality", type=int, default=95, help="JPEG quality for original_4k.jpg.")
-    parser.add_argument("--compressed-quality", type=int, default=85, help="JPEG quality for compressed_2k.jpg.")
-    parser.add_argument("--restored-quality", type=int, default=95, help="JPEG quality for restored_4k.jpg.")
-    parser.add_argument("--restore-sharpen", type=float, default=0.35, help="Unsharp amount after restoration.")
-    parser.add_argument(
-        "--detail-enhance",
-        action="store_true",
-        help="Enable OpenCV detailEnhance after upsampling. Better visual edges, slower on 4K.",
-    )
-    parser.add_argument("--sample-fps", type=float, default=1.0, help="Video sample rate. Default: 1 frame/sec.")
-    parser.add_argument("--max-samples", type=int, default=None, help="Limit processed video samples.")
-    parser.add_argument(
-        "--deblur-mode",
-        choices=["none", "unsharp", "wiener"],
-        default="none",
-        help="Debug interface for motion deblurring.",
-    )
-    parser.add_argument("--deblur-unsharp", type=float, default=0.55, help="Unsharp amount for deblur-mode=unsharp.")
-    parser.add_argument("--motion-length", type=int, default=15, help="Motion kernel length for deblur-mode=wiener.")
-    parser.add_argument("--motion-angle", type=float, default=0.0, help="Motion kernel angle for deblur-mode=wiener.")
-    parser.add_argument("--wiener-noise", type=float, default=0.02, help="Noise power for deblur-mode=wiener.")
+
+    if task == "compress_restore":
+        parser.add_argument("--compression-scale", type=float, default=0.5, help="Resize scale for the compressed representation. 0.5 maps 4K UHD to 2K/FHD.")
+        parser.add_argument("--original-quality", type=int, default=95, help="JPEG quality for original_4k.jpg.")
+        parser.add_argument("--compressed-quality", type=int, default=85, help="JPEG quality for compressed_2k.jpg.")
+        parser.add_argument("--restored-quality", type=int, default=95, help="JPEG quality for restored_4k.jpg.")
+        parser.add_argument("--restore-sharpen", type=float, default=0.35, help="Unsharp amount after restoration.")
+        parser.add_argument("--detail-enhance", action="store_true", help="Enable OpenCV detailEnhance after upsampling. Better visual edges, slower on 4K.")
+        parser.add_argument("--sample-fps", type=float, default=1.0, help="Video sample rate. Default: 1 frame/sec.")
+        parser.add_argument("--max-samples", type=int, default=None, help="Limit processed video samples.")
+    elif task == "deblur_select":
+        parser.add_argument("--preview-scale", type=float, default=0.5, help="Preview scale for interactive video UI.")
+        parser.add_argument("--video-seek-step", type=int, default=1, help="Default frame step for interactive video UI.")
+        parser.add_argument("--deblur-mode", choices=["unsharp", "wiener"], required=True, help="Deblur algorithm used in interactive selection mode.")
+        parser.add_argument("--deblur-unsharp", type=float, default=0.55, help="Unsharp amount for deblur-mode=unsharp.")
+        parser.add_argument("--motion-length", type=int, default=15, help="Motion kernel length for deblur-mode=wiener.")
+        parser.add_argument("--motion-angle", type=float, default=0.0, help="Motion kernel angle for deblur-mode=wiener.")
+        parser.add_argument("--wiener-noise", type=float, default=0.02, help="Noise power for deblur-mode=wiener.")
+        parser.add_argument("--selected-quality", type=int, default=95, help="JPEG quality for saved selected frames.")
+        parser.add_argument("--deblurred-quality", type=int, default=95, help="JPEG quality for saved deblurred frames.")
+    else:
+        raise ValueError(f"Unsupported task: {task}")
+
     return parser
+
+
+def parse_args() -> argparse.Namespace:
+    """解析命令行参数（两阶段：先获取 task，再加载对应参数）。"""
+    # 第一阶段：快速提取 task
+    temp = argparse.ArgumentParser(add_help=False)
+    temp.add_argument("--task", required=True, choices=["compress_restore", "deblur_select"])
+    known, _ = temp.parse_known_args()
+    
+    # 第二阶段：根据 task 构建完整解析器
+    parser = build_parser(known.task)
+    return parser.parse_args()
 
 
 def main() -> int:
     """程序入口：解析参数，并交给 io_control.run_batch() 执行。"""
 
-    parser = build_arg_parser()
-    args = parser.parse_args()
+    args = parse_args()
     input_path = Path(args.input).expanduser().resolve()
     output_dir = Path(args.output).expanduser().resolve()
     run_batch(input_path, output_dir, args)

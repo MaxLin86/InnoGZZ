@@ -54,7 +54,7 @@ def psnr(original_bgr: np.ndarray, candidate_bgr: np.ndarray) -> float:
 
     mse = np.mean((original_bgr.astype(np.float32) - candidate_bgr.astype(np.float32)) ** 2)
     if mse <= 1e-12:
-        return float("inf")
+        return 100.0  # 两图完全相同，MSE ≈ 0 时返回固定值而非 inf
     return 20.0 * math.log10(255.0 / math.sqrt(float(mse)))
 
 
