@@ -14,19 +14,53 @@
 - 视频的所有抽帧结果保存在同一个视频目录中，通过文件名中的帧号区分。
 - 对比原图保存为 JPEG 的大小与缩放到 2K 后保存为 JPEG 的大小。
 - 输出分层统计文件：
-- `summary_images.csv`：仅展示图像输入结果，最后一行为平均值。
-- `summary_videos.csv`：仅展示视频输入的“单视频平均结果”，最后一行为全部视频的平均值。
-- `summary_video_frames.csv`：记录视频逐帧子结果，主要用于留档和排查。
-- `summary.json`：同时保存图片汇总、视频汇总和逐帧明细的结构化结果。
+  - `summary_images.csv`：仅展示图像输入结果，最后一行为平均值。
+  - `summary_videos.csv`：仅展示视频输入的"单视频平均结果"，最后一行为全部视频的平均值。
+  - `summary_video_frames.csv`：记录视频逐帧子结果，主要用于留档和排查。
+  - `summary.json`：同时保存图片汇总、视频汇总和逐帧明细的结构化结果。
 - 运动模糊去除已提供 `none/unsharp/wiener` 调试接口，后续可以替换为深度学习模型。
 
 ## 代码结构
 
-```text
-demo.py        # 命令行入口，只负责解析参数和启动流程
-algorithms.py  # 算法模块：压缩还原、指标计算、去模糊接口
-io_control.py  # 输入输出控制：单图、单视频交互、目录批处理、文件保存、报告输出
 ```
+demo.py          # 命令行入口 (73行)
+  ↓ imports
+processing.py    # 工作流协调、交互式UI (390行)
+  ↓ imports
+algorithms.py    # 核心算法、图像处理 (350行)
+  ↓ imports
+summary.py       # 数据输出、表格生成 (520行)
+```
+
+### 分工：
+
+| 模块 | 职责 |
+|------|------|
+| **demo.py** | 📋 CLI参数解析、命令行入口 |
+| **algorithms.py** | 🔧 核心处理 `process_sample()`、压缩还原、质量评估、去模糊、视频读取 |
+| **summary.py** | 📊 CSV/JSON表格、数据统计、元数据保存、文件操作 |
+| **processing.py** | ⚙️ 工作流协调、交互式UI、目录批处理 |
+
+### 关键函数分布：
+
+**algorithms.py** 包含：
+- 核心处理：`process_sample()` ← 统一的图像/视频帧处理函数
+- 算法：`resize_by_scale()`, `restore_to_size()`, `psnr()`, `ssim_score()`, `blur_laplacian_var()`
+- 去模糊：`DeblurProcessor`, `motion_kernel()`, `wiener_deconvolution()`
+- 视频：`iter_video_samples()` (视频抽帧生成器)
+- 图像IO：`imread_bgr()`, `save_jpeg_raw()`, `file_size()`
+
+**processing.py** 包含：
+- UI函数：`resize_for_preview()`, `overlay_preview_info()`, `make_preview_panel()`
+- 交互式：`process_video_interactive()` (OpenCV窗口、按键控制)
+- 样本处理入口：`process_image()`, `process_video()`, `process_image_file()`, `process_video_file()`
+- 批处理：`process_input_directory()`, `run_batch()`
+
+**summary.py** 包含：
+- 数据类：`SampleMetrics`, `DeblurSelectionRecord`
+- 文件操作：`ensure_dir()`, `collect_media_files()`, `detect_input_kind()`
+- 表格生成：`build_metric_row()`, `aggregate_metric_rows()`, `build_summary_tables()`
+- IO接口：`write_summary()`, `write_csv_rows()`, `save_jpeg()`
 
 ## 运行示例
 
@@ -62,7 +96,7 @@ python3 demo.py --task compress_restore --input /path/to/input_folder --output o
 
 ## 输出结构
 
-```text
+```
 outputs/
   summary_images.csv
   summary_videos.csv
@@ -97,44 +131,3 @@ outputs/
 deblurred_4k.jpg
 frame_000000_t0000.000s__deblurred_4k.jpg
 ```
-
-交互式去模糊模式还会额外输出：
-
-```text
-deblur_selection.csv
-deblur_selection.json
-frame_000000_t0000.000s__selected.jpg
-frame_000000_t0000.000s__deblurred.jpg
-frame_000000_t0000.000s__deblur_metrics.json
-```
-
-## 视频交互模式按键
-
-- `a / d`：按当前步长前后移动
-- `j / l`：快速大步前后跳
-- `- / +`：减小或增大步长
-- `space`：播放 / 暂停
-- `s`：保存当前帧，并执行压缩、还原、去模糊
-- `q`：退出交互界面
-
-## 算法说明
-
-当前压缩还原链路采用传统图像算法，便于离线调试：
-
-1. 使用 `cv2.INTER_AREA` 将 4K 图像按 `--compression-scale 0.5` 缩放到 2K/FHD。
-2. 使用 JPEG 保存压缩结果，默认质量为 `85`。
-3. 使用 Lanczos 插值还原回原始尺寸。
-4. 使用轻量 unsharp mask 增强边缘，默认强度 `0.35`。
-5. 用 PSNR/SSIM 评估还原图和原图的相似度。
-
-如果后续要接入深度学习超分模型，可以保留 `process_sample()` 的输入输出协议，只替换 `restore_to_size()` 内部实现。
-
-## 运动模糊接口
-
-`DeblurProcessor.apply()` 是后续接入运动去模糊算法的位置。当前支持：
-
-- `none`：默认，不做去模糊。
-- `unsharp`：快速锐化基线，适合先验证后处理链路。
-- `wiener`：传统运动核 Wiener 去卷积，参数为 `--motion-length`、`--motion-angle`、`--wiener-noise`。
-
-后续可在该类中替换为深度学习模型，例如 MPRNet、Restormer、NAFNet 或自研模型推理接口。

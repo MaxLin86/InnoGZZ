@@ -2,8 +2,9 @@
 """4K 图像/视频压缩、还原与运动模糊调试 Demo 入口。
 
 代码拆分：
-  - algorithms.py：压缩还原、质量指标、运动模糊去除算法。
-  - io_control.py：输入输出控制、批处理流程、单图模式和交互式视频模式。
+  - algorithms.py：压缩还原、质量评估、去模糊算法、核心处理流程。
+  - summary.py：CSV/JSON 表格生成、数据统计、元数据保存、文件操作。
+  - processing.py：工作流协调、交互式界面、目录批处理、UI展示。
   - demo.py：只负责命令行参数和程序入口。
 """
 
@@ -11,7 +12,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from io_control import run_batch
+from processing import run_batch
 
 
 def build_parser(task: str) -> argparse.ArgumentParser:
