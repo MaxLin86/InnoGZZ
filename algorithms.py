@@ -1,11 +1,14 @@
 """算法模块：压缩还原、图像质量评估、运动模糊去除接口、图像读写与处理。"""
 
 import math
+import time
 from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
 import cv2
 import numpy as np
+
+from summary import SampleMetrics, ensure_dir, file_size, prefixed_name, save_jpeg, write_sample_metadata
 
 try:
     from skimage.metrics import structural_similarity
@@ -240,6 +243,34 @@ def iter_video_samples(
     capture.release()
 
 
+def iter_video_all_frames(
+    input_path: Path,
+) -> Iterable[Tuple[str, np.ndarray, int, float]]:
+    """视频逐帧生成器：遍历视频的每一帧，不进行抽帧。"""
+
+    capture = cv2.VideoCapture(str(input_path))
+    if not capture.isOpened():
+        raise ValueError(f"Cannot open video: {input_path}")
+
+    source_fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+    if source_fps <= 0.0:
+        source_fps = 30.0
+
+    frame_index = 0
+
+    while True:
+        ok, frame = capture.read()
+        if not ok:
+            break
+
+        timestamp_sec = frame_index / source_fps
+        sample_id = f"frame_{frame_index:06d}_t{timestamp_sec:08.3f}s"
+        yield sample_id, frame, frame_index, timestamp_sec
+        frame_index += 1
+
+    capture.release()
+
+
 # ============================================================================
 # 核心处理函数
 # ============================================================================
@@ -271,8 +302,7 @@ def process_sample(
     将原始图像进行压缩、还原，计算质量指标，并可选地进行去模糊处理。
     """
     
-    from summary import SampleMetrics, ensure_dir, file_size, prefixed_name, save_jpeg, write_sample_metadata
-    
+    start_time = time.time()
     ensure_dir(sample_dir)
 
     # 1. 先把原始 4K 帧压缩到 2K，得到真正用于传输或存储的压缩表示。
@@ -322,6 +352,9 @@ def process_sample(
     # 5. 计算文件大小压缩比、节省比例和图像质量指标。
     ratio = original_size / compressed_size if compressed_size > 0 else float("inf")
     saved_percent = (1.0 - compressed_size / original_size) * 100.0 if original_size > 0 else 0.0
+    
+    # 计算处理时间
+    processing_time = time.time() - start_time
 
     metrics = SampleMetrics(
         sample_id=sample_id,
@@ -347,7 +380,144 @@ def process_sample(
         psnr_deblurred=psnr_deblurred,
         ssim_deblurred=ssim_deblurred,
         blur_laplacian_var_deblurred=blur_deblurred,
+        compression_scale=compression_scale,
+        processing_time_sec=processing_time,
     )
 
     write_sample_metadata(sample_dir / prefixed_name(filename_prefix, "metrics.json"), metrics)
     return metrics
+
+
+def create_video_writer(
+    output_path: Path,
+    frame_width: int,
+    frame_height: int,
+    fps: float,
+    codec: str = "mp4v",
+) -> cv2.VideoWriter:
+    """创建视频写入器。"""
+    
+    ensure_dir(output_path.parent)
+    fourcc = cv2.VideoWriter_fourcc(*codec)
+    writer = cv2.VideoWriter(str(output_path), fourcc, fps, (frame_width, frame_height))
+    
+    if not writer.isOpened():
+        raise IOError(f"Failed to create video writer: {output_path}")
+    
+    return writer
+
+
+def process_video_to_mp4(
+    input_path: Path,
+    output_dir: Path,
+    compression_scale: float,
+    original_quality: int,
+    compressed_quality: int,
+    restored_quality: int,
+    restore_sharpen: float,
+    detail_enhance: bool,
+    filename_prefix: str = "",
+) -> Tuple[Path, Path, dict]:
+    """处理整个视频，输出压缩和还原后的 MP4 文件。
+    
+    Args:
+        filename_prefix: 文件名前缀，用于区分不同来源的视频（平铺模式）
+    
+    Returns:
+        Tuple[Path, Path, dict]: (compressed_mp4_path, restored_mp4_path, metadata_dict)
+    """
+    
+    start_time = time.time()
+    
+    capture = cv2.VideoCapture(str(input_path))
+    if not capture.isOpened():
+        raise ValueError(f"Cannot open video: {input_path}")
+    
+    # 获取视频信息
+    source_fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+    if source_fps <= 0.0:
+        source_fps = 30.0
+    total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    orig_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+    orig_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    # 计算压缩后的尺寸
+    comp_width = max(1, int(round(orig_width * compression_scale)))
+    comp_height = max(1, int(round(orig_height * compression_scale)))
+    
+    print(f"Video info: {total_frames} frames, {source_fps:.3f} FPS, {orig_width}x{orig_height} -> {comp_width}x{comp_height}")
+    
+    # 创建输出文件路径（使用文件名前缀）
+    if filename_prefix:
+        compressed_mp4_path = output_dir / f"{filename_prefix}_compressed.mp4"
+        restored_mp4_path = output_dir / f"{filename_prefix}_restored.mp4"
+    else:
+        compressed_mp4_path = output_dir / "compressed.mp4"
+        restored_mp4_path = output_dir / "restored.mp4"
+    
+    # 创建视频写入器
+    compressed_writer = create_video_writer(compressed_mp4_path, comp_width, comp_height, source_fps)
+    restored_writer = create_video_writer(restored_mp4_path, orig_width, orig_height, source_fps)
+    
+    print(f"Output videos will use FPS: {source_fps:.3f} (same as source)")
+    
+    try:
+        frame_index = 0
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            
+            # 压缩帧
+            compressed_frame = resize_by_scale(frame, compression_scale)
+            compressed_writer.write(compressed_frame)
+            
+            # 还原帧
+            restored_frame = restore_to_size(
+                compressed_frame,
+                (orig_width, orig_height),
+                restore_sharpen,
+                detail_enhance,
+            )
+            restored_writer.write(restored_frame)
+            
+            frame_index += 1
+            if frame_index % 100 == 0:
+                print(f"  Processed {frame_index}/{total_frames} frames")
+    
+    finally:
+        capture.release()
+        compressed_writer.release()
+        restored_writer.release()
+    
+    # 计算总处理时间
+    processing_time = time.time() - start_time
+    print(f"✓ Processing completed in {processing_time:.2f} seconds")
+    print(f"✓ Compressed video saved: {compressed_mp4_path}")
+    print(f"✓ Restored video saved: {restored_mp4_path}")
+    
+    # 获取文件大小
+    source_file_size = input_path.stat().st_size
+    compressed_file_size = compressed_mp4_path.stat().st_size
+    restored_file_size = restored_mp4_path.stat().st_size
+    
+    # 返回包含所有信息的字典
+    result = {
+        "input_path": str(input_path),
+        "compression_scale": compression_scale,
+        "original_quality": original_quality,
+        "compressed_quality": compressed_quality,
+        "restored_quality": restored_quality,
+        "restore_sharpen": restore_sharpen,
+        "detail_enhance": detail_enhance,
+        "source_fps": source_fps,
+        "total_frames": total_frames,
+        "original_resolution": f"{orig_width}x{orig_height}",
+        "compressed_resolution": f"{comp_width}x{comp_height}",
+        "processing_time_sec": processing_time,
+        "source_file_size": source_file_size,
+        "compressed_file_size": compressed_file_size,
+        "restored_file_size": restored_file_size,
+    }
+    
+    return compressed_mp4_path, restored_mp4_path, result

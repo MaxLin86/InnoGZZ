@@ -94,6 +94,17 @@ python3 demo.py --task compress_restore --input /path/to/input_folder --output o
 python3 demo.py --task compress_restore --input /path/to/input_folder --output outputs/batch_test --max-samples 5 --deblur-mode none
 ```
 
+**逐帧压缩模式**（新功能）：对视频的每一帧进行压缩及复原，跳过图像测试样本和原有的选帧逻辑：
+
+```bash
+python3 demo.py --task compress_restore --input /path/to/input_folder --output outputs/every_frame_test --every-frame-compression-scale 0.5 --original-quality 100 --compressed-quality 80 --restored-quality 100
+```
+
+此模式下：
+- 处理视频的所有帧（不抽帧）
+- 自动跳过文件夹中的图像文件
+- 生成完整的统计表格（summary_images.csv、summary_videos.csv、summary_video_frames.csv、summary.json）
+
 ## 输出结构
 
 ```

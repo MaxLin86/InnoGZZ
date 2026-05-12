@@ -68,6 +68,12 @@ class SampleMetrics:
     psnr_deblurred: Optional[float] = None
     ssim_deblurred: Optional[float] = None
     blur_laplacian_var_deblurred: Optional[float] = None
+    compression_scale: Optional[float] = None
+    processing_time_sec: Optional[float] = None
+    # MP4 模式专用字段
+    source_file_size: Optional[int] = None
+    compressed_file_size: Optional[int] = None
+    restored_file_size: Optional[int] = None
 
 
 @dataclass
@@ -114,6 +120,11 @@ SUMMARY_FIELDS = [
     "psnr_deblurred",
     "ssim_deblurred",
     "blur_laplacian_var_deblurred",
+    "compression_scale",
+    "processing_time_sec",
+    "source_file_size",
+    "compressed_file_size",
+    "restored_file_size",
 ]
 
 

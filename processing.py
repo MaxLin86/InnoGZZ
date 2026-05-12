@@ -1,9 +1,10 @@
 """处理与控制模块：工作流协调、交互式界面、目录批处理、UI展示。"""
 
 import argparse
+import csv
 import json
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
@@ -13,6 +14,8 @@ from algorithms import (
     blur_laplacian_var,
     imread_bgr,
     iter_video_samples,
+    iter_video_all_frames,
+    process_video_to_mp4,
     psnr,
     process_sample,
     ssim_score,
@@ -37,22 +40,24 @@ from summary import (
 )
 
 
-def output_dir_for_media(output_dir: Path, input_dir: Path, media_path: Path) -> Path:
-    """按输入目录层级生成输出目录，每个输入文件对应一个独立目录。"""
-
-    relative_without_suffix = media_path.relative_to(input_dir).with_suffix("")
-    return output_dir / relative_without_suffix
-
-
-def output_dir_for_single_file(output_dir: Path, input_path: Path) -> Path:
-    """为单图或单视频输入生成输出目录。"""
-
-    return output_dir / input_path.stem
-
-
 # ============================================================================
 # 交互式预览与显示函数
 # ============================================================================
+
+
+def output_dir_for_media(output_dir: Path, input_dir: Path, media_path: Path, every_frame_mode: bool = False) -> Path:
+    """生成输出目录。
+    
+    Args:
+        every_frame_mode: True=平铺模式（所有文件在同一目录），False=保持目录结构
+    """
+    if every_frame_mode:
+        # 平铺模式：所有文件输出到同一个目录
+        return output_dir
+    else:
+        # 正常模式：按输入目录层级生成输出目录
+        relative_without_suffix = media_path.relative_to(input_dir).with_suffix("")
+        return output_dir / relative_without_suffix
 
 
 def resize_for_preview(frame_bgr: np.ndarray, preview_scale: float) -> np.ndarray:
@@ -144,7 +149,7 @@ def process_image(
 def process_image_file(input_path: Path, output_dir: Path, args: argparse.Namespace) -> List[SampleMetrics]:
     """单图模式：直接处理一张输入图像。"""
 
-    sample_dir = output_dir_for_single_file(output_dir, input_path)
+    sample_dir = output_dir / input_path.stem
     sample_id = input_path.stem
     return process_image(input_path, sample_dir, args, sample_id)
 
@@ -152,7 +157,7 @@ def process_image_file(input_path: Path, output_dir: Path, args: argparse.Namesp
 def process_video_file(input_path: Path, output_dir: Path, args: argparse.Namespace) -> List[SampleMetrics]:
     """单视频压缩还原模式：按固定抽帧策略处理一个视频文件。"""
 
-    sample_dir = output_dir_for_single_file(output_dir, input_path)
+    sample_dir = output_dir / input_path.stem
     sample_id = input_path.stem
     return process_video(input_path, sample_dir, args, sample_id)
 
@@ -162,9 +167,34 @@ def process_video(
     sample_dir: Path,
     args: argparse.Namespace,
     sample_base_id: str,
-) -> List[SampleMetrics]:
-    """视频入口：逐个处理抽出的帧，并收集所有样本指标。"""
+) -> Union[List[SampleMetrics], dict]:
+    """视频入口：逐个处理抽出的帧，并收集所有样本指标.
+    
+    Returns:
+        List[SampleMetrics] for normal mode, or dict metadata for every-frame mode
+    """
 
+    # 检查是否启用逐帧压缩模式（输出 MP4）
+    every_frame_mode = getattr(args, "every_frame", False)
+    
+    if every_frame_mode:
+        # 逐帧压缩模式：处理整个视频并输出 MP4 文件，不生成单帧结果
+        print(f"Every-frame compression mode enabled (output as MP4)")
+        _, _, metadata = process_video_to_mp4(
+            input_path=input_path,
+            output_dir=sample_dir,
+            compression_scale=args.compression_scale,
+            original_quality=args.original_quality,
+            compressed_quality=args.compressed_quality,
+            restored_quality=args.restored_quality,
+            restore_sharpen=args.restore_sharpen,
+            detail_enhance=args.detail_enhance,
+            filename_prefix=sample_base_id.replace("/", "_"),
+        )
+        # 返回元数据字典
+        return metadata
+    
+    # 正常模式：按 sample_fps 抽帧
     metrics: List[SampleMetrics] = []
     for frame_sample_id, frame, frame_index, timestamp_sec in iter_video_samples(
         input_path,
@@ -195,6 +225,7 @@ def process_video(
                 timestamp_sec=timestamp_sec,
             )
         )
+    
     return metrics
 
 
@@ -210,7 +241,7 @@ def process_video_interactive(
 ) -> List[DeblurSelectionRecord]:
     """视频模式：打开交互式界面，通过按键选帧并保存处理结果。"""
 
-    sample_dir = output_dir_for_single_file(output_dir, input_path)
+    sample_dir = output_dir / input_path.stem
     ensure_dir(sample_dir)
 
     capture = cv2.VideoCapture(str(input_path))
@@ -356,6 +387,50 @@ def process_video_interactive(
 # ============================================================================
 
 
+def deblur_select_file(input_path: Path, output_dir: Path, args: argparse.Namespace) -> None:
+    """单视频交互式去模糊选择入口。"""
+    
+    input_kind = detect_input_kind(input_path)
+    if input_kind != "video":
+        raise ValueError(f"deblur_select requires a video file, got: {input_path}")
+    
+    process_video_interactive(input_path, output_dir, args)
+    print(f"Interactive deblur selection complete. Results saved to: {output_dir}")
+
+
+def deblur_select_directory(input_dir: Path, output_dir: Path, args: argparse.Namespace) -> None:
+    """目录批量交互式去模糊选择：遍历所有视频，依次打开交互式界面。"""
+    
+    # 仅搜集视频文件
+    from summary import VIDEO_EXTENSIONS
+    video_files = [
+        p for p in sorted(input_dir.rglob("*"))
+        if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS
+    ]
+    
+    if not video_files:
+        print(f"No video files found in: {input_dir}")
+        return
+    
+    print(f"Found {len(video_files)} video(s) for interactive processing")
+    
+    for index, video_path in enumerate(video_files, start=1):
+        print(f"\n[{index}/{len(video_files)}] Opening: {video_path}")
+        sample_dir = output_dir_for_media(output_dir, input_dir, video_path, every_frame_mode=False)
+        
+        try:
+            process_video_interactive(video_path, sample_dir, args)
+            print(f"✓ Completed: {video_path}")
+        except Exception as exc:
+            print(f"✗ Error processing {video_path}: {exc}")
+            import traceback
+            traceback.print_exc()
+        
+        print("-" * 80)
+    
+    print(f"\nAll videos processed. Results saved to: {output_dir}")
+
+
 def process_input_directory(input_dir: Path, output_dir: Path, args: argparse.Namespace) -> List[SampleMetrics]:
     """目录入口：批量处理文件夹中的图片、视频或混合素材。"""
 
@@ -364,23 +439,122 @@ def process_input_directory(input_dir: Path, output_dir: Path, args: argparse.Na
         print(f"No supported image/video files found in: {input_dir}")
         return []
 
+    # 检查是否启用逐帧压缩模式
+    every_frame_mode = getattr(args, "every_frame", False)
+    if every_frame_mode:
+        print("Every-frame compression mode: skipping image test samples, processing only videos")
+        # 过滤掉图像文件，只处理视频
+        media_files = [(path, kind) for path, kind in media_files if kind == "video"]
+        if not media_files:
+            print(f"No video files found in: {input_dir}")
+            return []
+
     all_metrics: List[SampleMetrics] = []
+    all_video_metadata = []  # 存储视频元数据
     failures: List[Tuple[Path, str]] = []
     for index, (media_path, input_kind) in enumerate(media_files, start=1):
         relative_name = media_path.relative_to(input_dir).with_suffix("").as_posix()
-        sample_dir = output_dir_for_media(output_dir, input_dir, media_path)
+        sample_dir = output_dir_for_media(output_dir, input_dir, media_path, every_frame_mode)
         print(f"[{index}/{len(media_files)}] Processing {input_kind}: {media_path}")
 
         try:
             if input_kind == "image":
                 all_metrics.extend(process_image(media_path, sample_dir, args, relative_name))
             else:
-                all_metrics.extend(process_video(media_path, sample_dir, args, relative_name))
+                result = process_video(media_path, sample_dir, args, relative_name)
+                if every_frame_mode and isinstance(result, dict):
+                    # 在 every-frame 模式下，result 是元数据字典
+                    all_video_metadata.append({
+                        "video_path": str(media_path),
+                        "metadata": result
+                    })
+                else:
+                    # 在正常模式下，result 是 SampleMetrics 列表
+                    all_metrics.extend(result)
         except Exception as exc:
             failures.append((media_path, str(exc)))
             print(f"Failed to process {media_path}: {exc}")
 
+    # 保存合并的统计信息到单个 CSV 文件（仅 every-frame 模式）
+    if every_frame_mode and all_video_metadata:
+        # MP4 模式：保存视频元数据为 CSV
+        stats_path = output_dir / "combined_statistics.csv"
+        ensure_dir(output_dir)
+        
+        if all_video_metadata:
+            # 获取所有字段名（从第一个视频的 metadata），并添加压缩率列
+            fieldnames = list(all_video_metadata[0]["metadata"].keys()) + ["compression_ratio"]
+            
+            with stats_path.open("w", encoding="utf-8-sig", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                
+                total_source_size = 0
+                total_compressed_size = 0
+                total_restored_size = 0
+                total_processing_time = 0
+                video_count = len(all_video_metadata)
+                
+                for item in all_video_metadata:
+                    # 转换文件大小为 MB
+                    row = item["metadata"].copy()
+                    
+                    source_mb = None
+                    compressed_mb = None
+                    restored_mb = None
+                    
+                    if "source_file_size" in row and row["source_file_size"] is not None:
+                        source_mb = round(row["source_file_size"] / (1024 * 1024), 2)
+                        row["source_file_size"] = source_mb
+                        total_source_size += row["source_file_size"]
+                    
+                    if "compressed_file_size" in row and row["compressed_file_size"] is not None:
+                        compressed_mb = round(row["compressed_file_size"] / (1024 * 1024), 2)
+                        row["compressed_file_size"] = compressed_mb
+                        total_compressed_size += row["compressed_file_size"]
+                    
+                    if "restored_file_size" in row and row["restored_file_size"] is not None:
+                        restored_mb = round(row["restored_file_size"] / (1024 * 1024), 2)
+                        row["restored_file_size"] = restored_mb
+                        total_restored_size += row["restored_file_size"]
+                    
+                    # 计算压缩率（压缩后大小 / 原始大小 * 100%）
+                    if source_mb and compressed_mb and source_mb > 0:
+                        row["compression_ratio"] = round((compressed_mb / source_mb) * 100, 2)
+                    else:
+                        row["compression_ratio"] = None
+                    
+                    if "processing_time_sec" in row and row["processing_time_sec"] is not None:
+                        total_processing_time += row["processing_time_sec"]
+                    
+                    writer.writerow(row)
+                
+                # 添加平均值行
+                avg_row = {field: "" for field in fieldnames}
+                avg_row[fieldnames[0]] = "AVERAGE"  # 在第一列标记为平均值
+                
+                if video_count > 0:
+                    if total_source_size > 0:
+                        avg_row["source_file_size"] = round(total_source_size / video_count, 2)
+                    if total_compressed_size > 0:
+                        avg_row["compressed_file_size"] = round(total_compressed_size / video_count, 2)
+                    if total_restored_size > 0:
+                        avg_row["restored_file_size"] = round(total_restored_size / video_count, 2)
+                    if total_processing_time > 0:
+                        avg_row["processing_time_sec"] = round(total_processing_time / video_count, 2)
+                    
+                    # 计算平均压缩率
+                    if avg_row["source_file_size"] and avg_row["compressed_file_size"]:
+                        avg_row["compression_ratio"] = round(
+                            (avg_row["compressed_file_size"] / avg_row["source_file_size"]) * 100, 2
+                        )
+                
+                writer.writerow(avg_row)
+            
+            print(f"Combined statistics saved to: {stats_path}")
+
     if failures:
+        ensure_dir(output_dir)
         failures_path = output_dir / "failures.json"
         with failures_path.open("w", encoding="utf-8") as handle:
             json.dump(
@@ -412,14 +586,10 @@ def run_batch(input_path: Path, output_dir: Path, args: argparse.Namespace) -> N
             print_summary(summary, output_dir)
     
     elif args.task == "deblur_select":
-        if not input_path.is_file():
-            raise ValueError("deblur_select requires a single video file as input, not a directory.")
-        input_kind = detect_input_kind(input_path)
-        if input_kind != "video":
-            raise ValueError("deblur_select requires a video file as input.")
-        
-        process_video_interactive(input_path, output_dir, args)
-        print(f"Interactive deblur selection complete. Results saved to: {output_dir}")
+        if input_path.is_file():
+            deblur_select_file(input_path, output_dir, args)
+        else:
+            deblur_select_directory(input_path, output_dir, args)
     
     else:
         raise ValueError(f"Unknown task: {args.task}")
