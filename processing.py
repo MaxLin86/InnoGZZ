@@ -250,9 +250,6 @@ def process_video(
                 restore_sharpen=args.restore_sharpen,
                 detail_enhance=args.detail_enhance,
                 deblur_mode=getattr(args, "deblur_mode", "none"),
-                motion_length=getattr(args, "motion_length", 15),
-                motion_angle=getattr(args, "motion_angle", 0.0),
-                wiener_noise=getattr(args, "wiener_noise", 0.02),
                 deblur_unsharp=getattr(args, "deblur_unsharp", 0.55),
                 filename_prefix=frame_sample_id,
                 frame_index=frame_index,
@@ -559,9 +556,6 @@ def process_video_interactive(
 
                 deblur_processor = DeblurProcessor(
                     mode=args.deblur_mode,
-                    motion_length=args.motion_length,
-                    motion_angle=args.motion_angle,
-                    wiener_noise=args.wiener_noise,
                     unsharp_amount=args.deblur_unsharp,
                 )
                 deblurred_frame = deblur_processor.apply(frame)

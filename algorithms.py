@@ -79,58 +79,12 @@ def blur_laplacian_var(image_bgr: np.ndarray) -> float:
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
-def motion_kernel(length: int, angle_deg: float) -> np.ndarray:
-    """生成指定长度和角度的线性运动模糊卷积核。"""
-
-    length = max(3, int(length))
-    if length % 2 == 0:
-        length += 1
-    kernel = np.zeros((length, length), dtype=np.float32)
-    center = length // 2
-    kernel[center, :] = 1.0
-    matrix = cv2.getRotationMatrix2D((center, center), angle_deg, 1.0)
-    kernel = cv2.warpAffine(kernel, matrix, (length, length))
-    kernel_sum = float(kernel.sum())
-    if kernel_sum <= 1e-6:
-        kernel[center, center] = 1.0
-        kernel_sum = 1.0
-    return kernel / kernel_sum
-
-
-def wiener_deconvolution(
-    image_bgr: np.ndarray,
-    kernel: np.ndarray,
-    noise_power: float = 0.02,
-) -> np.ndarray:
-    """传统 Wiener 去卷积，用于调试已知方向和长度的运动模糊。"""
-
-    image = image_bgr.astype(np.float32) / 255.0
-    height, width = image.shape[:2]
-    padded_kernel = np.zeros((height, width), dtype=np.float32)
-    kh, kw = kernel.shape[:2]
-    padded_kernel[:kh, :kw] = kernel
-    padded_kernel = np.roll(padded_kernel, -kh // 2, axis=0)
-    padded_kernel = np.roll(padded_kernel, -kw // 2, axis=1)
-    kernel_fft = np.fft.fft2(padded_kernel)
-    kernel_power = np.abs(kernel_fft) ** 2
-    inverse_filter = np.conj(kernel_fft) / (kernel_power + noise_power)
-
-    channels = []
-    for channel_index in range(3):
-        channel_fft = np.fft.fft2(image[:, :, channel_index])
-        restored = np.fft.ifft2(channel_fft * inverse_filter).real
-        channels.append(restored)
-    merged = np.stack(channels, axis=2)
-    return np.clip(merged * 255.0, 0, 255).astype(np.uint8)
-
-
 class DeblurProcessor:
     """运动模糊去除的统一调试接口。
 
     模式：
       - none：不处理，直接返回输入图。
       - unsharp：快速锐化基线，适合先验证后处理链路。
-      - wiener：传统运动核 Wiener 去卷积。
 
     后续如需接入深度学习模型，可以只替换 apply() 内部逻辑。
     """
@@ -138,17 +92,16 @@ class DeblurProcessor:
     def __init__(
         self,
         mode: str,
-        motion_length: int,
-        motion_angle: float,
-        wiener_noise: float,
         unsharp_amount: float,
     ) -> None:
-        """保存去模糊参数，便于 CLI 调试不同模式和不同运动核。"""
+        """保存去模糊参数，便于 CLI 调试不同模式。
+        
+        Args:
+            mode: 去模糊模式（none/unsharp）
+            unsharp_amount: Unsharp Mask 锐化强度
+        """
 
         self.mode = mode
-        self.motion_length = motion_length
-        self.motion_angle = motion_angle
-        self.wiener_noise = wiener_noise
         self.unsharp_amount = unsharp_amount
 
     def apply(self, image_bgr: np.ndarray) -> np.ndarray:
@@ -158,9 +111,6 @@ class DeblurProcessor:
             return image_bgr
         if self.mode == "unsharp":
             return unsharp_mask(image_bgr, amount=self.unsharp_amount, sigma=1.2)
-        if self.mode == "wiener":
-            kernel = motion_kernel(self.motion_length, self.motion_angle)
-            return wiener_deconvolution(image_bgr, kernel, noise_power=self.wiener_noise)
         raise ValueError(f"Unsupported deblur mode: {self.mode}")
 
 
@@ -289,9 +239,6 @@ def process_sample(
     restore_sharpen: float,
     detail_enhance: bool,
     deblur_mode: str = "none",
-    motion_length: int = 15,
-    motion_angle: float = 0.0,
-    wiener_noise: float = 0.02,
     deblur_unsharp: float = 0.55,
     filename_prefix: str = "",
     frame_index: Optional[int] = None,
@@ -337,9 +284,6 @@ def process_sample(
     if deblur_mode != "none":
         deblur_processor = DeblurProcessor(
             mode=deblur_mode,
-            motion_length=motion_length,
-            motion_angle=motion_angle,
-            wiener_noise=wiener_noise,
             unsharp_amount=deblur_unsharp,
         )
         deblurred_bgr = deblur_processor.apply(restored_bgr)
