@@ -87,11 +87,20 @@ class DeblurSelectionRecord:
     width: int
     height: int
     deblur_mode: str
-    original_jpg_bytes: int
-    deblurred_jpg_bytes: int
-    blur_score_original: float
-    blur_score_deblurred: float
-    blur_score_gain: float
+    current_jpg_bytes: int
+    selected_jpg_bytes: int
+    deblur_jpg_bytes: int
+    current_blur_score: float
+    selected_blur_score: float
+    deblur_blur_score: float
+    deblur_vs_selected_blur_gain: float
+    current_sharpness_score: Optional[float] = None
+    selected_frame_index: Optional[int] = None
+    selected_timestamp_sec: Optional[float] = None
+    selected_sharpness_score: Optional[float] = None
+    selected_offset: Optional[int] = None
+    temporal_radius: Optional[int] = None
+    temporal_stride: Optional[int] = None
 
 
 SUMMARY_FIELDS = [

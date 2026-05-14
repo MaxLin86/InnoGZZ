@@ -53,6 +53,42 @@ def unsharp_mask(image_bgr: np.ndarray, amount: float = 0.35, sigma: float = 1.0
     return np.clip(sharpened, 0, 255).astype(np.uint8)
 
 
+def luminance_unsharp_mask(
+    image_bgr: np.ndarray,
+    amount: float = 0.55,
+    sigma: float = 1.2,
+) -> np.ndarray:
+    """仅在亮度通道做非锐化，减少内镜图像常见的彩色边缘伪影。"""
+
+    lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
+    lightness, channel_a, channel_b = cv2.split(lab)
+    blurred = cv2.GaussianBlur(lightness, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    sharpened_l = cv2.addWeighted(lightness, 1.0 + amount, blurred, -amount, 0)
+    sharpened_lab = cv2.merge([np.clip(sharpened_l, 0, 255).astype(np.uint8), channel_a, channel_b])
+    return cv2.cvtColor(sharpened_lab, cv2.COLOR_LAB2BGR)
+
+
+def endoscopy_sharpness_score(image_bgr: np.ndarray) -> float:
+    """针对内镜帧的清晰度评分，忽略黑边和强反光，降低误选概率。"""
+
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    valid_mask = (gray > 18) & (gray < 245)
+    if int(valid_mask.sum()) < 256:
+        valid_mask = gray > 0
+
+    smoothed = cv2.GaussianBlur(gray, (3, 3), 0)
+    grad_x = cv2.Sobel(smoothed, cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(smoothed, cv2.CV_32F, 0, 1, ksize=3)
+    magnitude = cv2.magnitude(grad_x, grad_y)
+    valid_values = magnitude[valid_mask]
+    if valid_values.size == 0:
+        return 0.0
+
+    mean_score = float(np.mean(valid_values))
+    high_score = float(np.percentile(valid_values, 90))
+    return 0.65 * high_score + 0.35 * mean_score
+
+
 def psnr(original_bgr: np.ndarray, candidate_bgr: np.ndarray) -> float:
     """计算 PSNR，数值越高表示候选图越接近原图。"""
 
@@ -85,6 +121,7 @@ class DeblurProcessor:
     模式：
       - none：不处理，直接返回输入图。
       - unsharp：快速锐化基线，适合先验证后处理链路。
+      - temporal_unsharp：由调用方先选出邻域最清晰帧，再做亮度通道锐化。
 
     后续如需接入深度学习模型，可以只替换 apply() 内部逻辑。
     """
@@ -93,16 +130,19 @@ class DeblurProcessor:
         self,
         mode: str,
         unsharp_amount: float,
+        unsharp_sigma: float = 1.2,
     ) -> None:
         """保存去模糊参数，便于 CLI 调试不同模式。
         
         Args:
-            mode: 去模糊模式（none/unsharp）
+            mode: 去模糊模式（none/unsharp/temporal_unsharp）
             unsharp_amount: Unsharp Mask 锐化强度
+            unsharp_sigma: 高斯模糊半径，越大影响越宽的边缘
         """
 
         self.mode = mode
         self.unsharp_amount = unsharp_amount
+        self.unsharp_sigma = unsharp_sigma
 
     def apply(self, image_bgr: np.ndarray) -> np.ndarray:
         """根据 deblur_mode 执行对应去模糊策略。"""
@@ -110,7 +150,9 @@ class DeblurProcessor:
         if self.mode == "none":
             return image_bgr
         if self.mode == "unsharp":
-            return unsharp_mask(image_bgr, amount=self.unsharp_amount, sigma=1.2)
+            return unsharp_mask(image_bgr, amount=self.unsharp_amount, sigma=self.unsharp_sigma)
+        if self.mode == "temporal_unsharp":
+            return luminance_unsharp_mask(image_bgr, amount=self.unsharp_amount, sigma=self.unsharp_sigma)
         raise ValueError(f"Unsupported deblur mode: {self.mode}")
 
 

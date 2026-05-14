@@ -87,8 +87,11 @@
             "args": ["--task", "deblur_select",
                 "--input", "/media/maxlin/SATA/compress2k-test",
                 "--output", "./output-deblur-select",
-                "--deblur-mode", "unsharp",
+                "--deblur-mode", "temporal_unsharp",
+                "--temporal-radius", "6",
+                "--temporal-stride", "1",
                 "--deblur-unsharp", "0.55",
+                "--deblur-sigma", "1.2",
                 "--selected-quality", "100",
                 "--deblurred-quality", "100"]
         }

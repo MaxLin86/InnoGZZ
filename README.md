@@ -18,7 +18,7 @@
   - `summary_videos.csv`：仅展示视频输入的"单视频平均结果"，最后一行为全部视频的平均值。
   - `summary_video_frames.csv`：记录视频逐帧子结果，主要用于留档和排查。
   - `summary.json`：同时保存图片汇总、视频汇总和逐帧明细的结构化结果。
-- 运动模糊去除已提供 `none/unsharp/wiener` 调试接口，后续可以替换为深度学习模型。
+- 运动模糊去除调试集中在 `deblur_select`：`unsharp` 为单帧锐化基线，`temporal_unsharp` 会在当前帧前后搜索更清晰的邻近帧，再做亮度通道锐化。
 
 ## 代码结构
 
@@ -46,7 +46,7 @@ summary.py       # 数据输出、表格生成 (520行)
 **algorithms.py** 包含：
 - 核心处理：`process_sample()` ← 统一的图像/视频帧处理函数
 - 算法：`resize_by_scale()`, `restore_to_size()`, `psnr()`, `ssim_score()`, `blur_laplacian_var()`
-- 去模糊：`DeblurProcessor`, `motion_kernel()`, `wiener_deconvolution()`
+- 去模糊：`DeblurProcessor`, `luminance_unsharp_mask()`, `endoscopy_sharpness_score()`
 - 视频：`iter_video_samples()` (视频抽帧生成器)
 - 图像IO：`imread_bgr()`, `save_jpeg_raw()`, `file_size()`
 
@@ -67,31 +67,33 @@ summary.py       # 数据输出、表格生成 (520行)
 处理单张图片：
 
 ```bash
-python3 demo.py --task compress_restore --input /path/to/image_4k.jpg --output outputs/image_test --deblur-mode none
+python3 demo.py --task compress_restore --input /path/to/image_4k.jpg --output outputs/image_test
 ```
 
 处理单个视频并进入交互式选帧：
 
 ```bash
-python3 demo.py --task deblur_select --input /path/to/video_4k.mp4 --output outputs/video_ui_test --preview-scale 0.5 --video-seek-step 1 --deblur-mode unsharp
+python3 demo.py --task deblur_select --input /path/to/video_4k.mp4 --output outputs/video_ui_test --deblur-mode temporal_unsharp --temporal-radius 6
 ```
+
+`deblur_select` 保存 `current.jpg`、`selected.jpg`、`deblur.jpg` 和 `deblur_metrics.json`：其中 `current.jpg` 是你按下 `S` 时的视频帧，`selected.jpg` 是 sharp score 胜出、实际用于处理的帧，`deblur.jpg` 是结果图。
 
 处理一个输入文件夹：
 
 ```bash
-python3 demo.py --task compress_restore --input /path/to/input_folder --output outputs/batch_test --deblur-mode none
+python3 demo.py --task compress_restore --input /path/to/input_folder --output outputs/batch_test
 ```
 
 文件夹内的视频默认每秒抽取 1 帧：
 
 ```bash
-python3 demo.py --task compress_restore --input /path/to/input_folder --output outputs/batch_test --sample-fps 1 --deblur-mode none
+python3 demo.py --task compress_restore --input /path/to/input_folder --output outputs/batch_test --sample-fps 1
 ```
 
 每个视频只调试前 5 个抽帧样本：
 
 ```bash
-python3 demo.py --task compress_restore --input /path/to/input_folder --output outputs/batch_test --max-samples 5 --deblur-mode none
+python3 demo.py --task compress_restore --input /path/to/input_folder --output outputs/batch_test --max-samples 5
 ```
 
 **逐帧压缩模式**（新功能）：对视频的每一帧进行压缩及复原，跳过图像测试样本和原有的选帧逻辑：

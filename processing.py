@@ -12,6 +12,7 @@ import numpy as np
 from algorithms import (
     DeblurProcessor,
     blur_laplacian_var,
+    endoscopy_sharpness_score,
     imread_bgr,
     iter_video_samples,
     iter_video_all_frames,
@@ -298,6 +299,13 @@ def process_video_interactive(
     saved_records: List[DeblurSelectionRecord] = []
     last_deblurred_frame = None  # 保存最后一次去模糊的帧
     saved_original_frame = None  # 保存第一次选中的原始帧（用于预览面板固定显示）
+    last_selected_frame_index = None
+    last_selected_timestamp = None
+    last_selected_score = None
+    last_selected_offset = None
+    last_saved_original_score = None
+    last_selected_blur_score = None
+    last_deblur_blur_score = None
 
     window_name = "Video Frame Selector (1920x1350)"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -315,6 +323,40 @@ def process_video_interactive(
             raise ValueError(f"Failed to read frame {bounded_index} from: {input_path}")
         return frame, bounded_index / source_fps
 
+    def select_best_source_frame(center_index: int) -> Tuple[np.ndarray, int, float, float, int]:
+        """在当前帧附近挑出更清晰的一帧，作为非深度学习去模糊的可靠输入。"""
+
+        mode = getattr(args, "deblur_mode", "unsharp")
+        if mode != "temporal_unsharp":
+            frame, timestamp = read_frame(center_index)
+            return frame, center_index, timestamp, endoscopy_sharpness_score(frame), 0
+
+        radius = max(0, int(getattr(args, "temporal_radius", 6)))
+        stride = max(1, int(getattr(args, "temporal_stride", 1)))
+        first_index = max(0, center_index - radius)
+        last_index = min(max(total_frames - 1, 0), center_index + radius)
+
+        best_frame = None
+        best_index = center_index
+        best_timestamp = center_index / source_fps
+        best_score = -1.0
+
+        for candidate_index in range(first_index, last_index + 1, stride):
+            candidate_frame, candidate_timestamp = read_frame(candidate_index)
+            candidate_score = endoscopy_sharpness_score(candidate_frame)
+            if candidate_score > best_score:
+                best_frame = candidate_frame
+                best_index = candidate_index
+                best_timestamp = candidate_timestamp
+                best_score = candidate_score
+
+        if best_frame is None:
+            best_frame, best_timestamp = read_frame(center_index)
+            best_score = endoscopy_sharpness_score(best_frame)
+            best_index = center_index
+
+        return best_frame, best_index, best_timestamp, best_score, best_index - center_index
+
     def create_display_frame(frame: np.ndarray, deblurred_frame: np.ndarray = None, 
                             current_timestamp: float = 0.0) -> np.ndarray:
         """创建整合显示帧：上方视频+操作区，下方预览面板。
@@ -324,8 +366,8 @@ def process_video_interactive(
           - 左侧: 视频窗口 960×540
           - 右侧: 操作文字区域 960×540 (黑色背景)
         - 下半部分 (1920×810):
-          - 左下角: 原图 960×810
-          - 右下角: 去模糊图 960×810
+          - 左: 按键选中的原始帧
+          - 右: 去模糊结果
         
         Args:
             frame: 当前视频帧
@@ -340,7 +382,7 @@ def process_video_interactive(
         bottom_height = 810   # 下半部分高度（预览面板）
         video_width = 960     # 视频窗口宽度
         info_width = 960      # 操作信息区宽度
-        preview_width = 960   # 每个预览图宽度
+        preview_width = 960   # 两张预览图各占一半宽度
         total_width = 1920    # 总宽度
         total_height = 1350   # 总高度
         
@@ -353,16 +395,13 @@ def process_video_interactive(
         
         # 添加操作说明文字（放大字体，三列布局）
         blur_score_current = blur_laplacian_var(frame)
+        sharpness_score_current = endoscopy_sharpness_score(frame)
         
-        # 如果有保存的原始帧和去模糊帧，计算它们的模糊分数
-        if saved_original_frame is not None and last_deblurred_frame is not None:
-            blur_score_original = blur_laplacian_var(saved_original_frame)
-            blur_score_deblurred = blur_laplacian_var(last_deblurred_frame)
-            score_gain = blur_score_deblurred - blur_score_original
+        # blur 对比只在 selected 与 deblur 之间进行，避免把 current 帧混入结果评估。
+        if last_selected_blur_score is not None and last_deblur_blur_score is not None:
+            deblur_blur_gain = last_deblur_blur_score - last_selected_blur_score
         else:
-            blur_score_original = 0.0
-            blur_score_deblurred = 0.0
-            score_gain = 0.0
+            deblur_blur_gain = None
         
         # 三列布局：每列宽度约320像素
         col_width = info_width // 3  # 320像素
@@ -408,6 +447,7 @@ def process_video_interactive(
             f"Frame: {frame_index + 1}/{total_frames}",
             f"Time: {current_timestamp:.3f}s",
             f"Current blur: {blur_score_current:.2f}",
+            f"Current sharp: {sharpness_score_current:.2f}",
         ]
         
         for line in status_lines:
@@ -431,30 +471,33 @@ def process_video_interactive(
         # === 第三列：Preview Panel ===
         y_offset = 40
         preview_lines = [
-            "Preview Panel:",
+            "Saved Flow:",
             "",
-            f"Original score: {blur_score_original:.2f}" if blur_score_original > 0 else "Original score: N/A",
-            f"Deblurred score: {blur_score_deblurred:.2f}" if blur_score_deblurred > 0 else "Deblurred score: N/A",
-            f"Score gain: {score_gain:+.2f}" if score_gain != 0 else "Score gain: N/A",
+            f"Selected frame: {last_selected_frame_index + 1}" if last_selected_frame_index is not None else "Selected frame: N/A",
+            f"Selected offset: {last_selected_offset:+d}" if last_selected_offset is not None else "Selected offset: N/A",
+            f"Selected sharp: {last_selected_score:.2f}" if last_selected_score is not None else "Selected sharp: N/A",
+            f"Selected blur: {last_selected_blur_score:.2f}" if last_selected_blur_score is not None else "Selected blur: N/A",
+            f"Deblur blur: {last_deblur_blur_score:.2f}" if last_deblur_blur_score is not None else "Deblur blur: N/A",
+            f"Deblur vs selected: {deblur_blur_gain:+.2f}" if deblur_blur_gain is not None else "Deblur vs selected: N/A",
         ]
         
         for line in preview_lines:
-            if line == "Preview Panel:":
+            if line == "Saved Flow:":
                 # 标题用白色加粗
                 cv2.putText(info_panel, line, (col3_x, y_offset), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 0), 3, cv2.LINE_AA)
                 cv2.putText(info_panel, line, (col3_x, y_offset), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
-            elif "score:" in line.lower() or "gain:" in line.lower():
-                # 分数信息用黄色或绿色/红色
+            elif ":" in line:
+                # 信息行统一绘制，分数和增益用更醒目的颜色。
                 if "N/A" in line:
                     cv2.putText(info_panel, line, (col3_x, y_offset), 
                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
                     cv2.putText(info_panel, line, (col3_x, y_offset), 
                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (150, 150, 150), 2, cv2.LINE_AA)
-                elif "gain:" in line.lower():
+                elif "gain:" in line.lower() or line.lower().startswith("deblur vs selected:"):
                     # 增益值根据正负显示不同颜色
-                    if "+" in line or (score_gain > 0 and "-" not in line.split(":")[1].strip()):
+                    if "+" in line or (deblur_blur_gain is not None and deblur_blur_gain > 0 and "-" not in line.split(":")[1].strip()):
                         cv2.putText(info_panel, line, (col3_x, y_offset), 
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
                         cv2.putText(info_panel, line, (col3_x, y_offset), 
@@ -464,11 +507,16 @@ def process_video_interactive(
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
                         cv2.putText(info_panel, line, (col3_x, y_offset), 
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
-                else:
+                elif "score:" in line.lower() or "blur:" in line.lower():
                     cv2.putText(info_panel, line, (col3_x, y_offset), 
                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
                     cv2.putText(info_panel, line, (col3_x, y_offset), 
                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
+                else:
+                    cv2.putText(info_panel, line, (col3_x, y_offset), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
+                    cv2.putText(info_panel, line, (col3_x, y_offset), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2, cv2.LINE_AA)
             else:
                 # 空行
                 pass
@@ -479,30 +527,29 @@ def process_video_interactive(
         
         # === 下半部分：预览面板 ===
         if deblurred_frame is not None and saved_original_frame is not None:
-            # 使用保存的原始帧（固定不变）和去模糊帧
-            # 截断左侧三分之一并缩放到 960×810
-            cropped_original = crop_left_third(saved_original_frame)
-            cropped_deblurred = crop_left_third(deblurred_frame)
+            # 显示按键帧和最终结果；胜出的源帧只保存到文件，避免窗口过挤。
+            cropped_pressed = crop_left_third(saved_original_frame)
+            cropped_result = crop_left_third(deblurred_frame)
             
             # 缩放到目标尺寸
-            original_resized = cv2.resize(cropped_original, (preview_width, bottom_height), 
+            pressed_resized = cv2.resize(cropped_pressed, (preview_width, bottom_height), 
                                          interpolation=cv2.INTER_AREA)
-            deblurred_resized = cv2.resize(cropped_deblurred, (preview_width, bottom_height), 
-                                          interpolation=cv2.INTER_AREA)
+            result_resized = cv2.resize(cropped_result, (preview_width, bottom_height), 
+                                        interpolation=cv2.INTER_AREA)
             
             # 添加标签
-            cv2.putText(original_resized, "Original", (20, 40), 
+            cv2.putText(pressed_resized, "Current", (20, 40), 
                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 3, cv2.LINE_AA)
-            cv2.putText(original_resized, "Original", (20, 40), 
+            cv2.putText(pressed_resized, "Current", (20, 40), 
                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
             
-            cv2.putText(deblurred_resized, "Deblurred", (20, 40), 
+            cv2.putText(result_resized, "Deblur", (20, 40), 
                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 3, cv2.LINE_AA)
-            cv2.putText(deblurred_resized, "Deblurred", (20, 40), 
+            cv2.putText(result_resized, "Deblur", (20, 40), 
                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
             
             # 水平拼接
-            bottom_panel = cv2.hconcat([original_resized, deblurred_resized])
+            bottom_panel = cv2.hconcat([pressed_resized, result_resized])
         else:
             # 没有去模糊帧时，创建黑色占位面板
             bottom_panel = np.zeros((bottom_height, total_width, 3), dtype=np.uint8)
@@ -535,11 +582,9 @@ def process_video_interactive(
                 is_playing = not is_playing
                 continue
             if key == ord("a"):
-                is_playing = False
                 frame_index = max(0, frame_index - 100)
                 continue
             if key == ord("d"):
-                is_playing = False
                 frame_index = min(max(total_frames - 1, 0), frame_index + 100)
                 continue
             if key == ord("s"):
@@ -547,24 +592,49 @@ def process_video_interactive(
                 
                 # 每次保存时都更新原始帧（用于预览面板显示）
                 saved_original_frame = frame.copy()
-                
-                # 构建文件名（不包含路径前缀）
-                frame_sample_id = f"frame_{len(saved_records):06d}_t{timestamp_sec:08.3f}s"
-                original_path = sample_dir / prefixed_name(frame_sample_id, "selected.jpg")
-                deblurred_path = sample_dir / prefixed_name(frame_sample_id, "deblurred.jpg")
-                metadata_path = sample_dir / prefixed_name(frame_sample_id, "deblur_metrics.json")
 
                 deblur_processor = DeblurProcessor(
                     mode=args.deblur_mode,
                     unsharp_amount=args.deblur_unsharp,
+                    unsharp_sigma=getattr(args, "deblur_sigma", 1.2),
                 )
-                deblurred_frame = deblur_processor.apply(frame)
+                (
+                    source_frame,
+                    source_frame_index,
+                    source_timestamp,
+                    source_score,
+                    source_offset,
+                ) = select_best_source_frame(frame_index)
+
+                # 构建文件名（包含保存序号、原始帧号和实际选中帧号）。
+                frame_sample_id = (
+                    f"save_{len(saved_records):06d}"
+                    f"_cur_f{frame_index + 1:06d}"
+                    f"_sel_f{source_frame_index + 1:06d}"
+                    f"_t{timestamp_sec:08.3f}s"
+                )
+                original_path = sample_dir / prefixed_name(frame_sample_id, "current.jpg")
+                source_path = sample_dir / prefixed_name(frame_sample_id, "selected.jpg")
+                deblurred_path = sample_dir / prefixed_name(frame_sample_id, "deblur.jpg")
+                metadata_path = sample_dir / prefixed_name(frame_sample_id, "deblur_metrics.json")
+
+                deblurred_frame = deblur_processor.apply(source_frame)
                 last_deblurred_frame = deblurred_frame  # 保存用于显示
+                last_selected_frame_index = source_frame_index
+                last_selected_timestamp = source_timestamp
+                last_selected_score = source_score
+                last_selected_offset = source_offset
+                last_saved_original_score = endoscopy_sharpness_score(frame)
                 
                 original_size = save_jpeg(original_path, frame, args.selected_quality)
+                source_size = save_jpeg(source_path, source_frame, args.selected_quality)
                 deblurred_size = save_jpeg(deblurred_path, deblurred_frame, args.deblurred_quality)
 
+                pressed_blur_score = blur_laplacian_var(frame)
+                source_blur_score = blur_laplacian_var(source_frame)
                 blur_score_deblurred = blur_laplacian_var(deblurred_frame)
+                last_selected_blur_score = source_blur_score
+                last_deblur_blur_score = blur_score_deblurred
                 record = DeblurSelectionRecord(
                     sample_id=frame_sample_id,
                     source_path=str(input_path),
@@ -573,11 +643,20 @@ def process_video_interactive(
                     width=frame.shape[1],
                     height=frame.shape[0],
                     deblur_mode=args.deblur_mode,
-                    original_jpg_bytes=original_size,
-                    deblurred_jpg_bytes=deblurred_size,
-                    blur_score_original=blur_laplacian_var(frame),
-                    blur_score_deblurred=blur_score_deblurred,
-                    blur_score_gain=blur_score_deblurred - blur_laplacian_var(frame),
+                    current_jpg_bytes=original_size,
+                    selected_jpg_bytes=source_size,
+                    deblur_jpg_bytes=deblurred_size,
+                    current_blur_score=pressed_blur_score,
+                    selected_blur_score=source_blur_score,
+                    deblur_blur_score=blur_score_deblurred,
+                    deblur_vs_selected_blur_gain=blur_score_deblurred - source_blur_score,
+                    current_sharpness_score=last_saved_original_score,
+                    selected_frame_index=source_frame_index,
+                    selected_timestamp_sec=source_timestamp,
+                    selected_sharpness_score=source_score,
+                    selected_offset=source_offset,
+                    temporal_radius=getattr(args, "temporal_radius", None),
+                    temporal_stride=getattr(args, "temporal_stride", None),
                 )
                 write_deblur_selection_metadata(metadata_path, record)
                 saved_records.append(record)
@@ -590,8 +669,12 @@ def process_video_interactive(
                     "Saved frame: "
                     f"frame_index={frame_index}, "
                     f"time={timestamp_sec:.3f}s, "
-                    f"blur_score={blur_laplacian_var(frame):.2f}, "
-                    f"deblurred_blur_score={blur_score_deblurred:.2f}, "
+                    f"selected_frame_index={source_frame_index}, "
+                    f"selected_offset={source_offset:+d}, "
+                    f"selected_score={source_score:.2f}, "
+                    f"pressed_blur_score={pressed_blur_score:.2f}, "
+                    f"selected_blur_score={source_blur_score:.2f}, "
+                    f"deblur_blur_score={blur_score_deblurred:.2f}, "
                     f"output_prefix={frame_sample_id}"
                 )
                 continue

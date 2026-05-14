@@ -33,8 +33,11 @@ def build_parser(task: str) -> argparse.ArgumentParser:
         parser.add_argument("--max-samples", type=int, default=None, help="Limit processed video samples.")
         parser.add_argument("--every-frame", action="store_true", help="Enable per-frame compression for videos. When set, compress and restore every frame and output as MP4 files (compressed.mp4 and restored.mp4), skipping image test samples and frame selection logic.")
     elif task == "deblur_select":
-        parser.add_argument("--deblur-mode", choices=["unsharp"], default="unsharp", help="Deblur algorithm used in interactive selection mode (only unsharp supported).")
-        parser.add_argument("--deblur-unsharp", type=float, default=0.55, help="Unsharp amount for deblur-mode=unsharp.")
+        parser.add_argument("--deblur-mode", choices=["unsharp", "temporal_unsharp"], default="temporal_unsharp", help="Deblur algorithm used in interactive selection mode.")
+        parser.add_argument("--deblur-unsharp", type=float, default=0.55, help="Unsharp amount used by the deblur stage.")
+        parser.add_argument("--deblur-sigma", type=float, default=1.2, help="Gaussian sigma used by the unsharp stage.")
+        parser.add_argument("--temporal-radius", type=int, default=6, help="For temporal_unsharp, search this many frames before and after the current frame.")
+        parser.add_argument("--temporal-stride", type=int, default=1, help="For temporal_unsharp, evaluate every Nth frame in the temporal search window.")
         parser.add_argument("--selected-quality", type=int, default=95, help="JPEG quality for saved selected frames.")
         parser.add_argument("--deblurred-quality", type=int, default=95, help="JPEG quality for saved deblurred frames.")
     else:
