@@ -2,3 +2,5 @@
 **output**
 *.jpg
 *.png
+!docs/compress_restore_flow.png
+!docs/deblur_select_flow.png

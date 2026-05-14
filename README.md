@@ -35,7 +35,7 @@
 
 ### compress_restore 流程图
 
-![compress_restore 压缩还原流程](docs/compress_restore_flow.svg)
+![compress_restore 压缩还原流程](docs/compress_restore_flow.png)
 
 ### 运行示例
 
@@ -141,7 +141,7 @@ output/
 
 ### deblur_select 流程图
 
-![deblur_select 模糊选帧流程](docs/deblur_select_flow.svg)
+![deblur_select 模糊选帧流程](docs/deblur_select_flow.png)
 
 ### 命名约定
 
