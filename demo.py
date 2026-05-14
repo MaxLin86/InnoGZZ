@@ -9,7 +9,6 @@
 """
 
 import argparse
-import sys
 from pathlib import Path
 
 from processing import run_batch
@@ -38,8 +37,8 @@ def build_parser(task: str) -> argparse.ArgumentParser:
         parser.add_argument("--deblur-sigma", type=float, default=1.2, help="Gaussian sigma used by the unsharp stage.")
         parser.add_argument("--temporal-radius", type=int, default=6, help="For temporal_unsharp, search this many frames before and after the current frame.")
         parser.add_argument("--temporal-stride", type=int, default=1, help="For temporal_unsharp, evaluate every Nth frame in the temporal search window.")
-        parser.add_argument("--selected-quality", type=int, default=95, help="JPEG quality for saved selected frames.")
-        parser.add_argument("--deblurred-quality", type=int, default=95, help="JPEG quality for saved deblurred frames.")
+        parser.add_argument("--frame-quality", "--selected-quality", dest="frame_quality", type=int, default=95, help="JPEG quality for saved current and selected frames.")
+        parser.add_argument("--deblur-quality", "--deblurred-quality", dest="deblur_quality", type=int, default=95, help="JPEG quality for saved deblur frames.")
     else:
         raise ValueError(f"Unsupported task: {task}")
 
@@ -59,7 +58,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    """程序入口：解析参数，并交给 io_control.run_batch() 执行。"""
+    """程序入口：解析参数，并交给 processing.run_batch() 执行。"""
 
     args = parse_args()
     input_path = Path(args.input).expanduser().resolve()

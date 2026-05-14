@@ -4,7 +4,7 @@ import argparse
 import csv
 import json
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import List, Tuple, Union
 
 import cv2
 import numpy as np
@@ -15,34 +15,26 @@ from algorithms import (
     endoscopy_sharpness_score,
     imread_bgr,
     iter_video_samples,
-    iter_video_all_frames,
     process_video_to_mp4,
-    psnr,
     process_sample,
-    ssim_score,
+    select_best_frame_in_window,
 )
 from summary import (
-    IMAGE_EXTENSIONS,
-    VIDEO_EXTENSIONS,
     DeblurSelectionRecord,
     SampleMetrics,
     collect_media_files,
     detect_input_kind,
     ensure_dir,
-    is_relative_to,
-    metric_display_name,
-    metric_group_name,
     prefixed_name,
     print_summary,
     save_jpeg,
     write_deblur_selection_metadata,
-    write_sample_metadata,
     write_summary,
 )
 
 
 # ============================================================================
-# 交互式预览与显示函数
+# 路径与交互式预览函数
 # ============================================================================
 
 
@@ -61,93 +53,11 @@ def output_dir_for_media(output_dir: Path, input_dir: Path, media_path: Path, ev
         return output_dir / relative_without_suffix
 
 
-def resize_for_preview(frame_bgr: np.ndarray, preview_scale: float) -> np.ndarray:
-    """把预览帧缩放到适合交互窗口显示的尺寸。"""
-
-    if preview_scale <= 0:
-        preview_scale = 1.0
-    if abs(preview_scale - 1.0) < 1e-6:
-        return frame_bgr
-    height, width = frame_bgr.shape[:2]
-    preview_width = max(1, int(round(width * preview_scale)))
-    preview_height = max(1, int(round(height * preview_scale)))
-    return cv2.resize(frame_bgr, (preview_width, preview_height), interpolation=cv2.INTER_AREA)
-
-
-def overlay_preview_info(
-    frame_bgr: np.ndarray,
-    frame_index: int,
-    total_frames: int,
-    timestamp_sec: float,
-    blur_score: float,
-    step: int,
-    mode_text: str,
-) -> np.ndarray:
-    """在预览帧上叠加调试信息和按键提示。"""
-
-    preview = frame_bgr.copy()
-    lines = [
-        f"frame: {frame_index + 1}/{total_frames}",
-        f"time: {timestamp_sec:.3f}s",
-        f"blur_score: {blur_score:.2f}",
-        f"step: {step}",
-        f"mode: {mode_text}",
-        "keys: a/d move  j/l jump  -/+ step  space play/pause",
-        "keys: s save current frame  q quit",
-    ]
-    start_y = 28
-    for line in lines:
-        cv2.putText(preview, line, (16, start_y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 4, cv2.LINE_AA)
-        cv2.putText(preview, line, (16, start_y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 1, cv2.LINE_AA)
-        start_y += 28
-    return preview
-
-
 def crop_left_third(image: np.ndarray) -> np.ndarray:
     """截断图像左侧三分之一的像素。"""
-    height, width = image.shape[:2]
+    width = image.shape[1]
     crop_start = width // 3
     return image[:, crop_start:].copy()
-
-
-def make_combined_preview_panel(original_frame: np.ndarray, deblurred_frame: np.ndarray, 
-                                target_width: int = 540, target_height: int = 540) -> np.ndarray:
-    """创建整合预览面板：原图在右上，去模糊后的图在右下，并截断左侧三分之一像素。
-    
-    Args:
-        original_frame: 原始帧
-        deblurred_frame: 去模糊后的帧
-        target_width: 目标宽度（默认540）
-        target_height: 目标高度（默认540）
-    
-    Returns:
-        竖直拼接的预览面板（原图在上，去模糊后在下）
-    """
-    
-    # 先截断左侧三分之一像素
-    cropped_original = crop_left_third(original_frame)
-    cropped_deblurred = crop_left_third(deblurred_frame)
-    
-    # 缩放到目标大小
-    original_resized = cv2.resize(cropped_original, (target_width, target_height), interpolation=cv2.INTER_AREA)
-    deblurred_resized = cv2.resize(cropped_deblurred, (target_width, target_height), interpolation=cv2.INTER_AREA)
-    
-    # 竖直堆叠（上原图，下去模糊后）
-    preview_panel = cv2.vconcat([original_resized, deblurred_resized])
-    return preview_panel
-
-
-def make_preview_panel(images: list, max_height: int = 420) -> np.ndarray:
-    """把多张图拼成横向调试面板，便于观察去模糊前后差异。"""
-
-    panels = []
-    for image in images:
-        height, width = image.shape[:2]
-        scale = min(1.0, max_height / float(height))
-        target_size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
-        resized = cv2.resize(image, target_size, interpolation=cv2.INTER_AREA)
-        panels.append(resized)
-    return cv2.hconcat(panels)
 
 
 # ============================================================================
@@ -214,7 +124,7 @@ def process_video(
     
     if every_frame_mode:
         # 逐帧压缩模式：处理整个视频并输出 MP4 文件，不生成单帧结果
-        print(f"Every-frame compression mode enabled (output as MP4)")
+        print("Every-frame compression mode enabled (output as MP4)")
         _, _, metadata = process_video_to_mp4(
             input_path=input_path,
             output_dir=sample_dir,
@@ -297,13 +207,11 @@ def process_video_interactive(
     frame_index = 0
     is_playing = True  # 默认开启自动播放
     saved_records: List[DeblurSelectionRecord] = []
-    last_deblurred_frame = None  # 保存最后一次去模糊的帧
-    saved_original_frame = None  # 保存第一次选中的原始帧（用于预览面板固定显示）
+    last_deblur_frame = None
+    saved_current_frame = None
     last_selected_frame_index = None
-    last_selected_timestamp = None
     last_selected_score = None
     last_selected_offset = None
-    last_saved_original_score = None
     last_selected_blur_score = None
     last_deblur_blur_score = None
 
@@ -323,41 +231,7 @@ def process_video_interactive(
             raise ValueError(f"Failed to read frame {bounded_index} from: {input_path}")
         return frame, bounded_index / source_fps
 
-    def select_best_source_frame(center_index: int) -> Tuple[np.ndarray, int, float, float, int]:
-        """在当前帧附近挑出更清晰的一帧，作为非深度学习去模糊的可靠输入。"""
-
-        mode = getattr(args, "deblur_mode", "unsharp")
-        if mode != "temporal_unsharp":
-            frame, timestamp = read_frame(center_index)
-            return frame, center_index, timestamp, endoscopy_sharpness_score(frame), 0
-
-        radius = max(0, int(getattr(args, "temporal_radius", 6)))
-        stride = max(1, int(getattr(args, "temporal_stride", 1)))
-        first_index = max(0, center_index - radius)
-        last_index = min(max(total_frames - 1, 0), center_index + radius)
-
-        best_frame = None
-        best_index = center_index
-        best_timestamp = center_index / source_fps
-        best_score = -1.0
-
-        for candidate_index in range(first_index, last_index + 1, stride):
-            candidate_frame, candidate_timestamp = read_frame(candidate_index)
-            candidate_score = endoscopy_sharpness_score(candidate_frame)
-            if candidate_score > best_score:
-                best_frame = candidate_frame
-                best_index = candidate_index
-                best_timestamp = candidate_timestamp
-                best_score = candidate_score
-
-        if best_frame is None:
-            best_frame, best_timestamp = read_frame(center_index)
-            best_score = endoscopy_sharpness_score(best_frame)
-            best_index = center_index
-
-        return best_frame, best_index, best_timestamp, best_score, best_index - center_index
-
-    def create_display_frame(frame: np.ndarray, deblurred_frame: np.ndarray = None, 
+    def create_display_frame(frame: np.ndarray, deblur_frame: np.ndarray = None, 
                             current_timestamp: float = 0.0) -> np.ndarray:
         """创建整合显示帧：上方视频+操作区，下方预览面板。
         
@@ -366,12 +240,12 @@ def process_video_interactive(
           - 左侧: 视频窗口 960×540
           - 右侧: 操作文字区域 960×540 (黑色背景)
         - 下半部分 (1920×810):
-          - 左: 按键选中的原始帧
-          - 右: 去模糊结果
+          - 左: current 帧
+          - 右: deblur 结果
         
         Args:
             frame: 当前视频帧
-            deblurred_frame: 去模糊后的帧（可选）
+            deblur_frame: deblur 结果帧（可选）
             current_timestamp: 当前时间戳
         
         Returns:
@@ -384,7 +258,6 @@ def process_video_interactive(
         info_width = 960      # 操作信息区宽度
         preview_width = 960   # 两张预览图各占一半宽度
         total_width = 1920    # 总宽度
-        total_height = 1350   # 总高度
         
         # === 上半部分：视频 + 操作信息 ===
         # 缩放视频帧到 960×540
@@ -526,30 +399,30 @@ def process_video_interactive(
         top_panel = cv2.hconcat([video_resized, info_panel])
         
         # === 下半部分：预览面板 ===
-        if deblurred_frame is not None and saved_original_frame is not None:
-            # 显示按键帧和最终结果；胜出的源帧只保存到文件，避免窗口过挤。
-            cropped_pressed = crop_left_third(saved_original_frame)
-            cropped_result = crop_left_third(deblurred_frame)
+        if deblur_frame is not None and saved_current_frame is not None:
+            # 显示 current 和 deblur；selected 只保存到文件，避免窗口过挤。
+            cropped_current = crop_left_third(saved_current_frame)
+            cropped_deblur = crop_left_third(deblur_frame)
             
             # 缩放到目标尺寸
-            pressed_resized = cv2.resize(cropped_pressed, (preview_width, bottom_height), 
+            current_resized = cv2.resize(cropped_current, (preview_width, bottom_height), 
                                          interpolation=cv2.INTER_AREA)
-            result_resized = cv2.resize(cropped_result, (preview_width, bottom_height), 
+            deblur_resized = cv2.resize(cropped_deblur, (preview_width, bottom_height), 
                                         interpolation=cv2.INTER_AREA)
             
             # 添加标签
-            cv2.putText(pressed_resized, "Current", (20, 40), 
+            cv2.putText(current_resized, "Current", (20, 40), 
                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 3, cv2.LINE_AA)
-            cv2.putText(pressed_resized, "Current", (20, 40), 
+            cv2.putText(current_resized, "Current", (20, 40), 
                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
             
-            cv2.putText(result_resized, "Deblur", (20, 40), 
+            cv2.putText(deblur_resized, "Deblur", (20, 40), 
                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 3, cv2.LINE_AA)
-            cv2.putText(result_resized, "Deblur", (20, 40), 
+            cv2.putText(deblur_resized, "Deblur", (20, 40), 
                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
             
             # 水平拼接
-            bottom_panel = cv2.hconcat([pressed_resized, result_resized])
+            bottom_panel = cv2.hconcat([current_resized, deblur_resized])
         else:
             # 没有去模糊帧时，创建黑色占位面板
             bottom_panel = np.zeros((bottom_height, total_width, 3), dtype=np.uint8)
@@ -566,7 +439,7 @@ def process_video_interactive(
             frame, timestamp_sec = read_frame(frame_index)
             
             # 创建整合显示帧
-            display_frame = create_display_frame(frame, last_deblurred_frame, timestamp_sec)
+            display_frame = create_display_frame(frame, last_deblur_frame, timestamp_sec)
             cv2.imshow(window_name, display_frame)
 
             wait_ms = max(1, int(round(1000.0 / source_fps))) if is_playing else 0
@@ -590,8 +463,8 @@ def process_video_interactive(
             if key == ord("s"):
                 is_playing = False  # 按下S时停止自动播放
                 
-                # 每次保存时都更新原始帧（用于预览面板显示）
-                saved_original_frame = frame.copy()
+                # 保存 current 帧，用于下方预览面板显示。
+                saved_current_frame = frame.copy()
 
                 deblur_processor = DeblurProcessor(
                     mode=args.deblur_mode,
@@ -599,42 +472,49 @@ def process_video_interactive(
                     unsharp_sigma=getattr(args, "deblur_sigma", 1.2),
                 )
                 (
-                    source_frame,
-                    source_frame_index,
-                    source_timestamp,
-                    source_score,
-                    source_offset,
-                ) = select_best_source_frame(frame_index)
+                    selected_frame,
+                    selected_frame_index,
+                    selected_timestamp,
+                    selected_score,
+                    selected_offset,
+                ) = select_best_frame_in_window(
+                    center_index=frame_index,
+                    frame_reader=read_frame,
+                    total_frames=total_frames,
+                    video_fps=source_fps,
+                    mode=getattr(args, "deblur_mode", "unsharp"),
+                    temporal_radius=getattr(args, "temporal_radius", 6),
+                    temporal_stride=getattr(args, "temporal_stride", 1),
+                )
 
-                # 构建文件名（包含保存序号、原始帧号和实际选中帧号）。
+                # 文件名前缀包含保存序号、current 帧号和 selected 帧号。
                 frame_sample_id = (
                     f"save_{len(saved_records):06d}"
                     f"_cur_f{frame_index + 1:06d}"
-                    f"_sel_f{source_frame_index + 1:06d}"
+                    f"_sel_f{selected_frame_index + 1:06d}"
                     f"_t{timestamp_sec:08.3f}s"
                 )
-                original_path = sample_dir / prefixed_name(frame_sample_id, "current.jpg")
-                source_path = sample_dir / prefixed_name(frame_sample_id, "selected.jpg")
-                deblurred_path = sample_dir / prefixed_name(frame_sample_id, "deblur.jpg")
+                current_path = sample_dir / prefixed_name(frame_sample_id, "current.jpg")
+                selected_path = sample_dir / prefixed_name(frame_sample_id, "selected.jpg")
+                deblur_path = sample_dir / prefixed_name(frame_sample_id, "deblur.jpg")
                 metadata_path = sample_dir / prefixed_name(frame_sample_id, "deblur_metrics.json")
 
-                deblurred_frame = deblur_processor.apply(source_frame)
-                last_deblurred_frame = deblurred_frame  # 保存用于显示
-                last_selected_frame_index = source_frame_index
-                last_selected_timestamp = source_timestamp
-                last_selected_score = source_score
-                last_selected_offset = source_offset
-                last_saved_original_score = endoscopy_sharpness_score(frame)
+                deblur_frame = deblur_processor.apply(selected_frame)
+                last_deblur_frame = deblur_frame  # 保存用于显示
+                last_selected_frame_index = selected_frame_index
+                last_selected_score = selected_score
+                last_selected_offset = selected_offset
+                current_sharpness_score = endoscopy_sharpness_score(frame)
                 
-                original_size = save_jpeg(original_path, frame, args.selected_quality)
-                source_size = save_jpeg(source_path, source_frame, args.selected_quality)
-                deblurred_size = save_jpeg(deblurred_path, deblurred_frame, args.deblurred_quality)
+                current_size = save_jpeg(current_path, frame, args.frame_quality)
+                selected_size = save_jpeg(selected_path, selected_frame, args.frame_quality)
+                deblur_size = save_jpeg(deblur_path, deblur_frame, args.deblur_quality)
 
-                pressed_blur_score = blur_laplacian_var(frame)
-                source_blur_score = blur_laplacian_var(source_frame)
-                blur_score_deblurred = blur_laplacian_var(deblurred_frame)
-                last_selected_blur_score = source_blur_score
-                last_deblur_blur_score = blur_score_deblurred
+                current_blur_score = blur_laplacian_var(frame)
+                selected_blur_score = blur_laplacian_var(selected_frame)
+                deblur_blur_score = blur_laplacian_var(deblur_frame)
+                last_selected_blur_score = selected_blur_score
+                last_deblur_blur_score = deblur_blur_score
                 record = DeblurSelectionRecord(
                     sample_id=frame_sample_id,
                     source_path=str(input_path),
@@ -643,18 +523,18 @@ def process_video_interactive(
                     width=frame.shape[1],
                     height=frame.shape[0],
                     deblur_mode=args.deblur_mode,
-                    current_jpg_bytes=original_size,
-                    selected_jpg_bytes=source_size,
-                    deblur_jpg_bytes=deblurred_size,
-                    current_blur_score=pressed_blur_score,
-                    selected_blur_score=source_blur_score,
-                    deblur_blur_score=blur_score_deblurred,
-                    deblur_vs_selected_blur_gain=blur_score_deblurred - source_blur_score,
-                    current_sharpness_score=last_saved_original_score,
-                    selected_frame_index=source_frame_index,
-                    selected_timestamp_sec=source_timestamp,
-                    selected_sharpness_score=source_score,
-                    selected_offset=source_offset,
+                    current_jpg_bytes=current_size,
+                    selected_jpg_bytes=selected_size,
+                    deblur_jpg_bytes=deblur_size,
+                    current_blur_score=current_blur_score,
+                    selected_blur_score=selected_blur_score,
+                    deblur_blur_score=deblur_blur_score,
+                    deblur_vs_selected_blur_gain=deblur_blur_score - selected_blur_score,
+                    current_sharpness_score=current_sharpness_score,
+                    selected_frame_index=selected_frame_index,
+                    selected_timestamp_sec=selected_timestamp,
+                    selected_sharpness_score=selected_score,
+                    selected_offset=selected_offset,
                     temporal_radius=getattr(args, "temporal_radius", None),
                     temporal_stride=getattr(args, "temporal_stride", None),
                 )
@@ -662,19 +542,19 @@ def process_video_interactive(
                 saved_records.append(record)
 
                 # 更新显示以显示预览面板
-                display_frame = create_display_frame(frame, deblurred_frame, timestamp_sec)
+                display_frame = create_display_frame(frame, deblur_frame, timestamp_sec)
                 cv2.imshow(window_name, display_frame)
                 
                 print(
                     "Saved frame: "
                     f"frame_index={frame_index}, "
                     f"time={timestamp_sec:.3f}s, "
-                    f"selected_frame_index={source_frame_index}, "
-                    f"selected_offset={source_offset:+d}, "
-                    f"selected_score={source_score:.2f}, "
-                    f"pressed_blur_score={pressed_blur_score:.2f}, "
-                    f"selected_blur_score={source_blur_score:.2f}, "
-                    f"deblur_blur_score={blur_score_deblurred:.2f}, "
+                    f"selected_frame_index={selected_frame_index}, "
+                    f"selected_offset={selected_offset:+d}, "
+                    f"selected_score={selected_score:.2f}, "
+                    f"current_blur_score={current_blur_score:.2f}, "
+                    f"selected_blur_score={selected_blur_score:.2f}, "
+                    f"deblur_blur_score={deblur_blur_score:.2f}, "
                     f"output_prefix={frame_sample_id}"
                 )
                 continue
@@ -806,7 +686,7 @@ def process_input_directory(input_dir: Path, output_dir: Path, args: argparse.Na
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
                 
-                total_source_size = 0
+                total_selected_size = 0
                 total_compressed_size = 0
                 total_restored_size = 0
                 total_processing_time = 0
@@ -823,7 +703,7 @@ def process_input_directory(input_dir: Path, output_dir: Path, args: argparse.Na
                     if "source_file_size" in row and row["source_file_size"] is not None:
                         source_mb = round(row["source_file_size"] / (1024 * 1024), 2)
                         row["source_file_size"] = source_mb
-                        total_source_size += row["source_file_size"]
+                        total_selected_size += row["source_file_size"]
                     
                     if "compressed_file_size" in row and row["compressed_file_size"] is not None:
                         compressed_mb = round(row["compressed_file_size"] / (1024 * 1024), 2)
@@ -851,8 +731,8 @@ def process_input_directory(input_dir: Path, output_dir: Path, args: argparse.Na
                 avg_row[fieldnames[0]] = "AVERAGE"  # 在第一列标记为平均值
                 
                 if video_count > 0:
-                    if total_source_size > 0:
-                        avg_row["source_file_size"] = round(total_source_size / video_count, 2)
+                    if total_selected_size > 0:
+                        avg_row["source_file_size"] = round(total_selected_size / video_count, 2)
                     if total_compressed_size > 0:
                         avg_row["compressed_file_size"] = round(total_compressed_size / video_count, 2)
                     if total_restored_size > 0:

@@ -3,12 +3,12 @@
 import math
 import time
 from pathlib import Path
-from typing import Iterable, Optional, Tuple
+from typing import Callable, Iterable, Optional, Tuple
 
 import cv2
 import numpy as np
 
-from summary import SampleMetrics, ensure_dir, file_size, prefixed_name, save_jpeg, write_sample_metadata
+from summary import SampleMetrics, ensure_dir, prefixed_name, save_jpeg, write_sample_metadata
 
 try:
     from skimage.metrics import structural_similarity
@@ -87,6 +87,52 @@ def endoscopy_sharpness_score(image_bgr: np.ndarray) -> float:
     mean_score = float(np.mean(valid_values))
     high_score = float(np.percentile(valid_values, 90))
     return 0.65 * high_score + 0.35 * mean_score
+
+
+def select_best_frame_in_window(
+    center_index: int,
+    frame_reader: Callable[[int], Tuple[np.ndarray, float]],
+    total_frames: int,
+    video_fps: float,
+    mode: str,
+    temporal_radius: int,
+    temporal_stride: int,
+) -> Tuple[np.ndarray, int, float, float, int]:
+    """在 current 帧附近挑出 sharpness score 最高的 selected 帧。
+
+    Returns:
+        (selected_frame, selected_index, selected_timestamp, selected_score, selected_offset)
+    """
+
+    if mode != "temporal_unsharp":
+        frame, timestamp = frame_reader(center_index)
+        return frame, center_index, timestamp, endoscopy_sharpness_score(frame), 0
+
+    radius = max(0, int(temporal_radius))
+    stride = max(1, int(temporal_stride))
+    first_index = max(0, center_index - radius)
+    last_index = min(max(total_frames - 1, 0), center_index + radius)
+
+    best_frame = None
+    best_index = center_index
+    best_timestamp = center_index / video_fps
+    best_score = -1.0
+
+    for candidate_index in range(first_index, last_index + 1, stride):
+        candidate_frame, candidate_timestamp = frame_reader(candidate_index)
+        candidate_score = endoscopy_sharpness_score(candidate_frame)
+        if candidate_score > best_score:
+            best_frame = candidate_frame
+            best_index = candidate_index
+            best_timestamp = candidate_timestamp
+            best_score = candidate_score
+
+    if best_frame is None:
+        best_frame, best_timestamp = frame_reader(center_index)
+        best_score = endoscopy_sharpness_score(best_frame)
+        best_index = center_index
+
+    return best_frame, best_index, best_timestamp, best_score, best_index - center_index
 
 
 def psnr(original_bgr: np.ndarray, candidate_bgr: np.ndarray) -> float:
@@ -300,12 +346,12 @@ def process_sample(
     compressed_height, compressed_width = compressed_bgr.shape[:2]
 
     # 2. 准备输出路径：原图 JPEG、2K 压缩 JPEG、4K 还原 JPEG。
-    original_path = sample_dir / prefixed_name(filename_prefix, "original_4k.jpg")
+    current_path = sample_dir / prefixed_name(filename_prefix, "original_4k.jpg")
     compressed_path = sample_dir / prefixed_name(filename_prefix, "compressed_2k.jpg")
     restored_path = sample_dir / prefixed_name(filename_prefix, "restored_4k.jpg")
     
     # 3-1. 保存原图 JPEG、2K 压缩 JPEG
-    original_size = save_jpeg(original_path, image_bgr, original_quality)
+    current_size = save_jpeg(current_path, image_bgr, original_quality)
     compressed_size = save_jpeg(compressed_path, compressed_bgr, compressed_quality)
     
     # 3-2. 重新读取压缩图，并且还原到原图大小。
@@ -319,7 +365,7 @@ def process_sample(
     restored_size = save_jpeg(restored_path, restored_bgr, restored_quality)
 
     # 4. 压缩还原模式默认不做去模糊；只有显式启用时才额外输出 deblurred_4k.jpg。
-    deblurred_size = None
+    deblur_size = None
     psnr_deblurred = None
     ssim_deblurred = None
     blur_deblurred = None
@@ -329,15 +375,15 @@ def process_sample(
             unsharp_amount=deblur_unsharp,
         )
         deblurred_bgr = deblur_processor.apply(restored_bgr)
-        deblurred_path = sample_dir / prefixed_name(filename_prefix, "deblurred_4k.jpg")
-        deblurred_size = save_jpeg(deblurred_path, deblurred_bgr, restored_quality)
+        deblur_path = sample_dir / prefixed_name(filename_prefix, "deblurred_4k.jpg")
+        deblur_size = save_jpeg(deblur_path, deblurred_bgr, restored_quality)
         psnr_deblurred = psnr(image_bgr, deblurred_bgr)
         ssim_deblurred = ssim_score(image_bgr, deblurred_bgr)
         blur_deblurred = blur_laplacian_var(deblurred_bgr)
 
     # 5. 计算文件大小压缩比、节省比例和图像质量指标。
-    ratio = original_size / compressed_size if compressed_size > 0 else float("inf")
-    saved_percent = (1.0 - compressed_size / original_size) * 100.0 if original_size > 0 else 0.0
+    ratio = current_size / compressed_size if compressed_size > 0 else float("inf")
+    saved_percent = (1.0 - compressed_size / current_size) * 100.0 if current_size > 0 else 0.0
     
     # 计算处理时间
     processing_time = time.time() - start_time
@@ -352,7 +398,7 @@ def process_sample(
         height=height,
         compressed_width=compressed_width,
         compressed_height=compressed_height,
-        original_jpg_bytes=original_size,
+        original_jpg_bytes=current_size,
         compressed_2k_jpg_bytes=compressed_size,
         restored_jpg_bytes=restored_size,
         jpg_size_ratio=ratio,
@@ -362,7 +408,7 @@ def process_sample(
         blur_laplacian_var_original=blur_laplacian_var(image_bgr),
         blur_laplacian_var_restored=blur_laplacian_var(restored_bgr),
         deblur_mode=deblur_mode,
-        deblurred_jpg_bytes=deblurred_size,
+        deblurred_jpg_bytes=deblur_size,
         psnr_deblurred=psnr_deblurred,
         ssim_deblurred=ssim_deblurred,
         blur_laplacian_var_deblurred=blur_deblurred,

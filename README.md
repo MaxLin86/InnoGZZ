@@ -1,146 +1,216 @@
-# 4K 图像/视频压缩还原 Demo
+# 4K 图像/视频调试工具
 
-这个工作区提供一个可直接调试的 `demo.py`，核心流程是：
+本项目提供一个入口脚本 `demo.py`，当前包含两个互相独立的任务：
 
-- 输入既可以是单张图片、单个视频，也可以是一个包含图片和视频的文件夹。
-- 运行时必须明确指定 `--task`，并且同一次运行只能启动一个功能。
-- `compress_restore`：只做压缩与还原。
-- `deblur_select`：只做视频选帧与去模糊。
-- 单张图片会直接进入单帧处理模式。
-- 单个视频会进入交互式选帧界面，通过按键挑选要保存和处理的帧。
-- 输入文件夹时会走批处理模式，自动扫描其中的图片和视频。
-- 输出目录保持输入文件夹的目录层级；每张图片或每个视频都会有自己的输出目录。
-- 图片输出 `original_4k.jpg`、`compressed_2k.jpg`、`restored_4k.jpg`。
-- 视频的所有抽帧结果保存在同一个视频目录中，通过文件名中的帧号区分。
-- 对比原图保存为 JPEG 的大小与缩放到 2K 后保存为 JPEG 的大小。
-- 输出分层统计文件：
-  - `summary_images.csv`：仅展示图像输入结果，最后一行为平均值。
-  - `summary_videos.csv`：仅展示视频输入的"单视频平均结果"，最后一行为全部视频的平均值。
-  - `summary_video_frames.csv`：记录视频逐帧子结果，主要用于留档和排查。
-  - `summary.json`：同时保存图片汇总、视频汇总和逐帧明细的结构化结果。
-- 运动模糊去除调试集中在 `deblur_select`：`unsharp` 为单帧锐化基线，`temporal_unsharp` 会在当前帧前后搜索更清晰的邻近帧，再做亮度通道锐化。
+- `compress_restore`：压缩、还原和质量统计。
+- `deblur_select`：消化内镜视频交互式选帧和非深度学习去模糊调试。
 
-## 代码结构
+下面先介绍通用信息，然后分别说明压缩还原和去模糊选帧。
 
-```
-demo.py          # 命令行入口 (73行)
-  ↓ imports
-processing.py    # 工作流协调、交互式UI (390行)
-  ↓ imports
-algorithms.py    # 核心算法、图像处理 (350行)
-  ↓ imports
-summary.py       # 数据输出、表格生成 (520行)
-```
+## 通用信息
 
-### 分工：
+### 代码结构
 
 | 模块 | 职责 |
 |------|------|
-| **demo.py** | 📋 CLI参数解析、命令行入口 |
-| **algorithms.py** | 🔧 核心处理 `process_sample()`、压缩还原、质量评估、去模糊、视频读取 |
-| **summary.py** | 📊 CSV/JSON表格、数据统计、元数据保存、文件操作 |
-| **processing.py** | ⚙️ 工作流协调、交互式UI、目录批处理 |
+| `demo.py` | 命令行参数解析和程序入口。 |
+| `algorithms.py` | 压缩还原、质量指标、selected 帧选择、deblur 处理。 |
+| `processing.py` | 工作流协调、OpenCV 交互窗口、目录批处理。 |
+| `summary.py` | 数据类、CSV/JSON 汇总、文件保存工具。 |
+| `docs/` | 面向 C++ 端开发人员的核心流程图。 |
 
-### 关键函数分布：
+### 通用参数
 
-**algorithms.py** 包含：
-- 核心处理：`process_sample()` ← 统一的图像/视频帧处理函数
-- 算法：`resize_by_scale()`, `restore_to_size()`, `psnr()`, `ssim_score()`, `blur_laplacian_var()`
-- 去模糊：`DeblurProcessor`, `luminance_unsharp_mask()`, `endoscopy_sharpness_score()`
-- 视频：`iter_video_samples()` (视频抽帧生成器)
-- 图像IO：`imread_bgr()`, `save_jpeg_raw()`, `file_size()`
+| 参数 | 说明 |
+|------|------|
+| `--task` | 必填。可选 `compress_restore` 或 `deblur_select`。 |
+| `--input` | 必填。输入文件或目录。 |
+| `--output` | 输出目录，默认 `outputs`。 |
 
-**processing.py** 包含：
-- UI函数：`resize_for_preview()`, `overlay_preview_info()`, `make_preview_panel()`
-- 交互式：`process_video_interactive()` (OpenCV窗口、按键控制)
-- 样本处理入口：`process_image()`, `process_video()`, `process_image_file()`, `process_video_file()`
-- 批处理：`process_input_directory()`, `run_batch()`
+下面示例与 `.vscode/launch.json` 保持一致。
 
-**summary.py** 包含：
-- 数据类：`SampleMetrics`, `DeblurSelectionRecord`
-- 文件操作：`ensure_dir()`, `collect_media_files()`, `detect_input_kind()`
-- 表格生成：`build_metric_row()`, `aggregate_metric_rows()`, `build_summary_tables()`
-- IO接口：`write_summary()`, `write_csv_rows()`, `save_jpeg()`
+## 压缩还原：compress_restore
 
-## 运行示例
+`compress_restore` 用于验证 4K/2K 图像或视频的压缩、还原和统计输出。该流程已定型，主要输出原图 JPEG、压缩 JPEG、还原 JPEG，以及 CSV/JSON 统计。
 
-处理单张图片：
+### compress_restore 流程图
+
+![compress_restore 压缩还原流程](docs/compress_restore_flow.svg)
+
+### 运行示例
+
+抽帧压缩还原：
 
 ```bash
-python3 demo.py --task compress_restore --input /path/to/image_4k.jpg --output outputs/image_test
+python3 demo.py \
+  --task compress_restore \
+  --input /media/maxlin/SATA/compress4k-test \
+  --output ./output-best-05-100-80-100 \
+  --max-samples 100 \
+  --sample-fps 0.5 \
+  --compression-scale 0.5 \
+  --original-quality 100 \
+  --compressed-quality 80 \
+  --restored-quality 100
 ```
 
-处理单个视频并进入交互式选帧：
+4K 输入逐帧压缩还原并输出视频：
 
 ```bash
-python3 demo.py --task deblur_select --input /path/to/video_4k.mp4 --output outputs/video_ui_test --deblur-mode temporal_unsharp --temporal-radius 6
+python3 demo.py \
+  --task compress_restore \
+  --input /media/maxlin/SATA/compress4k-test \
+  --output ./output-best-05-100-80-100-everyframe4k \
+  --compression-scale 0.5 \
+  --original-quality 100 \
+  --compressed-quality 80 \
+  --restored-quality 100 \
+  --every-frame
 ```
 
-`deblur_select` 保存 `current.jpg`、`selected.jpg`、`deblur.jpg` 和 `deblur_metrics.json`：其中 `current.jpg` 是你按下 `S` 时的视频帧，`selected.jpg` 是 sharp score 胜出、实际用于处理的帧，`deblur.jpg` 是结果图。
-
-处理一个输入文件夹：
+2K 输入逐帧压缩还原并输出视频：
 
 ```bash
-python3 demo.py --task compress_restore --input /path/to/input_folder --output outputs/batch_test
+python3 demo.py \
+  --task compress_restore \
+  --input /media/maxlin/SATA/compress2k-test \
+  --output ./output-best-05-100-80-100-everyframe2k \
+  --compression-scale 0.5 \
+  --original-quality 100 \
+  --compressed-quality 80 \
+  --restored-quality 100 \
+  --every-frame
 ```
 
-文件夹内的视频默认每秒抽取 1 帧：
+### compress_restore 参数
 
-```bash
-python3 demo.py --task compress_restore --input /path/to/input_folder --output outputs/batch_test --sample-fps 1
-```
+| 参数 | 说明 |
+|------|------|
+| `--compression-scale` | 压缩缩放比例。`0.5` 表示宽高各缩小一半。 |
+| `--original-quality` | 保存 `original_4k.jpg` 的 JPEG 质量。 |
+| `--compressed-quality` | 保存 `compressed_2k.jpg` 的 JPEG 质量。 |
+| `--restored-quality` | 保存 `restored_4k.jpg` 的 JPEG 质量。 |
+| `--restore-sharpen` | 还原后追加的 unsharp 强度。 |
+| `--detail-enhance` | 启用 OpenCV `detailEnhance`。4K 上会更慢。 |
+| `--sample-fps` | 视频抽帧频率。 |
+| `--max-samples` | 限制视频抽帧样本数。 |
+| `--every-frame` | 逐帧处理视频并输出 MP4。 |
 
-每个视频只调试前 5 个抽帧样本：
+### compress_restore 输出
 
-```bash
-python3 demo.py --task compress_restore --input /path/to/input_folder --output outputs/batch_test --max-samples 5
-```
+常规抽帧输出：
 
-**逐帧压缩模式**（新功能）：对视频的每一帧进行压缩及复原，跳过图像测试样本和原有的选帧逻辑：
-
-```bash
-python3 demo.py --task compress_restore --input /path/to/input_folder --output outputs/every_frame_test --every-frame-compression-scale 0.5 --original-quality 100 --compressed-quality 80 --restored-quality 100
-```
-
-此模式下：
-- 处理视频的所有帧（不抽帧）
-- 自动跳过文件夹中的图像文件
-- 生成完整的统计表格（summary_images.csv、summary_videos.csv、summary_video_frames.csv、summary.json）
-
-## 输出结构
-
-```
+```text
 outputs/
   summary_images.csv
   summary_videos.csv
   summary_video_frames.csv
   summary.json
-  scene_a/
-    image_a/
-      original_4k.jpg
-      compressed_2k.jpg
-      restored_4k.jpg
-      metrics.json
-    video_a/
-      frame_000000_t0000.000s__original_4k.jpg
-      frame_000000_t0000.000s__compressed_2k.jpg
-      frame_000000_t0000.000s__restored_4k.jpg
-      frame_000000_t0000.000s__metrics.json
-      frame_000001_t0001.000s__original_4k.jpg
-      frame_000001_t0001.000s__compressed_2k.jpg
-      frame_000001_t0001.000s__restored_4k.jpg
-      frame_000001_t0001.000s__metrics.json
+  video_a/
+    frame_000000_t0000.000s__original_4k.jpg
+    frame_000000_t0000.000s__compressed_2k.jpg
+    frame_000000_t0000.000s__restored_4k.jpg
+    frame_000000_t0000.000s__metrics.json
 ```
 
 其中：
 
 - `summary_images.csv` 只看图片输入。
-- `summary_videos.csv` 只看每个视频的平均结果，逐帧明细默认不混在主表里。
-- `summary_video_frames.csv` 保留逐帧记录，便于后续排查具体帧。
+- `summary_videos.csv` 只看每个视频的平均结果。
+- `summary_video_frames.csv` 保留逐帧记录。
+- `summary.json` 保存结构化汇总。
 
-如果启用去模糊，还会额外输出：
+逐帧 MP4 输出：
 
 ```text
-deblurred_4k.jpg
-frame_000000_t0000.000s__deblurred_4k.jpg
+output/
+  <video_name>_compressed.mp4
+  <video_name>_restored.mp4
+  combined_statistics.csv
 ```
+
+## 去模糊选帧：deblur_select
+
+`deblur_select` 用于消化内镜视频的交互式选帧调试。`temporal_unsharp` 不使用深度学习模型。它会在 current 前后搜索 sharpness score 更高的 selected 帧，再对 selected 做亮度通道 unsharp。
+
+关键算法入口：
+
+- `select_best_frame_in_window()`：在 current 邻域内选 selected。
+- `endoscopy_sharpness_score()`：内镜帧清晰度评分。
+- `DeblurProcessor.apply()`：对 selected 生成 deblur。
+
+### deblur_select 流程图
+
+![deblur_select 模糊选帧流程](docs/deblur_select_flow.svg)
+
+### 命名约定
+
+| 名称 | 含义 | 保存后缀 |
+|------|------|----------|
+| `current` | 按 `S` 时视频窗口所在帧。 | `__current.jpg` |
+| `selected` | 在 current 邻域内用 sharpness score 选出的最佳帧。 | `__selected.jpg` |
+| `deblur` | 对 selected 做亮度通道 unsharp 后的结果。 | `__deblur.jpg` |
+
+保存前缀包含保存序号、current 帧号、selected 帧号和时间戳：
+
+```text
+save_000000_cur_f001001_sel_f001004_t0033.367s__current.jpg
+save_000000_cur_f001001_sel_f001004_t0033.367s__selected.jpg
+save_000000_cur_f001001_sel_f001004_t0033.367s__deblur.jpg
+save_000000_cur_f001001_sel_f001004_t0033.367s__deblur_metrics.json
+```
+
+### 运行示例
+
+```bash
+python3 demo.py \
+  --task deblur_select \
+  --input /media/maxlin/SATA/compress2k-test \
+  --output ./output-deblur-select \
+  --deblur-mode temporal_unsharp \
+  --temporal-radius 6 \
+  --temporal-stride 1 \
+  --deblur-unsharp 0.55 \
+  --deblur-sigma 1.2 \
+  --frame-quality 100 \
+  --deblur-quality 100
+```
+
+### deblur_select 参数
+
+| 参数 | 说明 |
+|------|------|
+| `--deblur-mode` | `unsharp` 或 `temporal_unsharp`。 |
+| `--temporal-radius` | selected 搜索半径，向前/向后各多少帧。 |
+| `--temporal-stride` | selected 搜索步长。 |
+| `--deblur-unsharp` | deblur 阶段 unsharp 强度。 |
+| `--deblur-sigma` | deblur 阶段高斯 sigma。 |
+| `--frame-quality` | current 和 selected JPEG 质量。 |
+| `--deblur-quality` | deblur JPEG 质量。 |
+
+`--selected-quality` 和 `--deblurred-quality` 仍作为旧参数别名保留，但新配置建议使用 `--frame-quality` 和 `--deblur-quality`。
+
+### 交互按键
+
+| 按键 | 动作 |
+|------|------|
+| `Space` | 播放/暂停。 |
+| `A` | 后退 100 帧；如果原本在播放，跳转后继续播放。 |
+| `D` | 前进 100 帧；如果原本在播放，跳转后继续播放。 |
+| `S` | 保存当前调试样本，并暂停播放。 |
+| `Q` 或 `Esc` | 退出当前视频。 |
+
+调试窗口右上角 `Saved Flow` 显示的是上一次保存样本的 selected/deblur 指标；第二列 `Status` 显示的是当前视频窗口所在帧的指标。
+
+### deblur_select 输出
+
+```text
+output-deblur-select/
+  video_a/
+    save_000000_cur_f001001_sel_f001004_t0033.367s__current.jpg
+    save_000000_cur_f001001_sel_f001004_t0033.367s__selected.jpg
+    save_000000_cur_f001001_sel_f001004_t0033.367s__deblur.jpg
+    save_000000_cur_f001001_sel_f001004_t0033.367s__deblur_metrics.json
+```
+
+`deblur_metrics.json` 记录 current/selected/deblur 的帧号、时间戳、sharpness score、blur score、文件大小和参数。

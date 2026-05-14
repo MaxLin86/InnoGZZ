@@ -92,8 +92,8 @@
                 "--temporal-stride", "1",
                 "--deblur-unsharp", "0.55",
                 "--deblur-sigma", "1.2",
-                "--selected-quality", "100",
-                "--deblurred-quality", "100"]
+                "--frame-quality", "100",
+                "--deblur-quality", "100"]
         }
     ]
 }
