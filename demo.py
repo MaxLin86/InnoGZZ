@@ -23,9 +23,9 @@ def build_parser(task: str) -> argparse.ArgumentParser:
 
     if task == "compress_restore":
         parser.add_argument("--compression-scale", type=float, default=0.5, help="Resize scale for the compressed representation. 0.5 maps 4K UHD to 2K/FHD.")
-        parser.add_argument("--original-quality", type=int, default=95, help="JPEG quality for original_4k.jpg.")
-        parser.add_argument("--compressed-quality", type=int, default=85, help="JPEG quality for compressed_2k.jpg.")
-        parser.add_argument("--restored-quality", type=int, default=95, help="JPEG quality for restored_4k.jpg.")
+        parser.add_argument("--original-quality", type=int, default=100, help="JPEG quality for original_4k.jpg.")
+        parser.add_argument("--compressed-quality", type=int, default=80, help="JPEG quality for compressed_2k.jpg.")
+        parser.add_argument("--restored-quality", type=int, default=100, help="JPEG quality for restored_4k.jpg.")
         parser.add_argument("--restore-sharpen", type=float, default=0.35, help="Unsharp amount after restoration.")
         parser.add_argument("--detail-enhance", action="store_true", help="Enable OpenCV detailEnhance after upsampling. Better visual edges, slower on 4K.")
         parser.add_argument("--sample-fps", type=float, default=1.0, help="Video sample rate. Default: 1 frame/sec.")
