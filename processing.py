@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List, Tuple, Union
 
@@ -217,6 +218,8 @@ def process_video_interactive(
     last_deblur_blur_score = None
     last_select_elapsed_sec = None
     last_total_elapsed_sec = None
+    last_visible_current_blur_score = None
+    last_visible_current_sharpness_score = None
 
     window_name = "Video Frame Selector (1920x1350)"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -233,6 +236,29 @@ def process_video_interactive(
         if not ok or frame is None:
             raise ValueError(f"Failed to read frame {bounded_index} from: {input_path}")
         return frame, bounded_index / source_fps
+
+    def prefetch_temporal_window(center_index: int, current_frame: np.ndarray, current_timestamp: float) -> dict:
+        """按顺序预读 temporal_unsharp 的候选窗口，避免每个候选帧都随机 seek。"""
+
+        frame_cache = {center_index: (current_frame, current_timestamp)}
+        if getattr(args, "deblur_mode", "unsharp") != "temporal_unsharp":
+            return frame_cache
+
+        radius = max(0, int(getattr(args, "temporal_radius", 6)))
+        stride = max(1, int(getattr(args, "temporal_stride", 1)))
+        first_index = max(0, center_index - radius)
+        last_index = min(max(total_frames - 1, 0), center_index + radius)
+        candidate_indices = set(range(first_index, last_index + 1, stride))
+
+        capture.set(cv2.CAP_PROP_POS_FRAMES, first_index)
+        for candidate_index in range(first_index, last_index + 1):
+            ok, candidate_frame = capture.read()
+            if not ok or candidate_frame is None:
+                break
+            if candidate_index in candidate_indices:
+                frame_cache[candidate_index] = (candidate_frame, candidate_index / source_fps)
+
+        return frame_cache
 
     def create_display_frame(frame: np.ndarray, deblur_frame: np.ndarray = None, 
                             current_timestamp: float = 0.0) -> np.ndarray:
@@ -254,6 +280,8 @@ def process_video_interactive(
         Returns:
             整合后的显示帧（1920×1350）
         """
+        nonlocal last_visible_current_blur_score, last_visible_current_sharpness_score
+
         # 目标尺寸
         top_height = 540      # 上半部分高度
         bottom_height = 810   # 下半部分高度（预览面板）
@@ -272,6 +300,8 @@ def process_video_interactive(
         # 添加操作说明文字（放大字体，三列布局）
         blur_score_current = blur_laplacian_var(frame)
         sharpness_score_current = endoscopy_sharpness_score(frame)
+        last_visible_current_blur_score = blur_score_current
+        last_visible_current_sharpness_score = sharpness_score_current
         
         # blur 对比只在 selected 与 deblur 之间进行，避免把 current 帧混入结果评估。
         if last_selected_blur_score is not None and last_deblur_blur_score is not None:
@@ -478,6 +508,15 @@ def process_video_interactive(
                     unsharp_sigma=getattr(args, "deblur_sigma", 1.2),
                 )
                 select_start = time.perf_counter()
+                frame_cache = prefetch_temporal_window(frame_index, frame, timestamp_sec)
+
+                def cached_read_frame(target_index: int) -> Tuple[np.ndarray, float]:
+                    bounded_index = max(0, min(target_index, max(total_frames - 1, 0)))
+                    cached = frame_cache.get(bounded_index)
+                    if cached is not None:
+                        return cached
+                    return read_frame(bounded_index)
+
                 (
                     selected_frame,
                     selected_frame_index,
@@ -486,7 +525,7 @@ def process_video_interactive(
                     selected_offset,
                 ) = select_best_frame_in_window(
                     center_index=frame_index,
-                    frame_reader=read_frame,
+                    frame_reader=cached_read_frame,
                     total_frames=total_frames,
                     video_fps=source_fps,
                     mode=getattr(args, "deblur_mode", "unsharp"),
@@ -512,13 +551,25 @@ def process_video_interactive(
                 last_selected_frame_index = selected_frame_index
                 last_selected_score = selected_score
                 last_selected_offset = selected_offset
-                current_sharpness_score = endoscopy_sharpness_score(frame)
-                
-                current_size = save_jpeg(current_path, frame, args.frame_quality)
-                selected_size = save_jpeg(selected_path, selected_frame, args.frame_quality)
-                deblur_size = save_jpeg(deblur_path, deblur_frame, args.deblur_quality)
+                current_sharpness_score = (
+                    last_visible_current_sharpness_score
+                    if last_visible_current_sharpness_score is not None
+                    else endoscopy_sharpness_score(frame)
+                )
+                current_blur_score = (
+                    last_visible_current_blur_score
+                    if last_visible_current_blur_score is not None
+                    else blur_laplacian_var(frame)
+                )
 
-                current_blur_score = blur_laplacian_var(frame)
+                with ThreadPoolExecutor(max_workers=3) as executor:
+                    current_future = executor.submit(save_jpeg, current_path, frame, args.frame_quality)
+                    selected_future = executor.submit(save_jpeg, selected_path, selected_frame, args.frame_quality)
+                    deblur_future = executor.submit(save_jpeg, deblur_path, deblur_frame, args.deblur_quality)
+                    current_size = current_future.result()
+                    selected_size = selected_future.result()
+                    deblur_size = deblur_future.result()
+
                 selected_blur_score = blur_laplacian_var(selected_frame)
                 deblur_blur_score = blur_laplacian_var(deblur_frame)
                 last_selected_blur_score = selected_blur_score
