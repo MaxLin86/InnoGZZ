@@ -101,6 +101,8 @@ class DeblurSelectionRecord:
     selected_offset: Optional[int] = None
     temporal_radius: Optional[int] = None
     temporal_stride: Optional[int] = None
+    select_elapsed_sec: Optional[float] = None
+    total_elapsed_sec: Optional[float] = None
 
 
 SUMMARY_FIELDS = [

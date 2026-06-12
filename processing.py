@@ -3,6 +3,7 @@
 import argparse
 import csv
 import json
+import time
 from pathlib import Path
 from typing import List, Tuple, Union
 
@@ -214,6 +215,8 @@ def process_video_interactive(
     last_selected_offset = None
     last_selected_blur_score = None
     last_deblur_blur_score = None
+    last_select_elapsed_sec = None
+    last_total_elapsed_sec = None
 
     window_name = "Video Frame Selector (1920x1350)"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -319,8 +322,8 @@ def process_video_interactive(
             "",
             f"Frame: {frame_index + 1}/{total_frames}",
             f"Time: {current_timestamp:.3f}s",
-            f"Current blur: {blur_score_current:.2f}",
             f"Current sharp: {sharpness_score_current:.2f}",
+            f"Current blur: {blur_score_current:.2f}",
         ]
         
         for line in status_lines:
@@ -352,6 +355,8 @@ def process_video_interactive(
             f"Selected blur: {last_selected_blur_score:.2f}" if last_selected_blur_score is not None else "Selected blur: N/A",
             f"Deblur blur: {last_deblur_blur_score:.2f}" if last_deblur_blur_score is not None else "Deblur blur: N/A",
             f"Deblur vs selected: {deblur_blur_gain:+.2f}" if deblur_blur_gain is not None else "Deblur vs selected: N/A",
+            f"Select time: {last_select_elapsed_sec * 1000.0:.1f}ms" if last_select_elapsed_sec is not None else "Select time: N/A",
+            f"Total time: {last_total_elapsed_sec * 1000.0:.1f}ms" if last_total_elapsed_sec is not None else "Total time: N/A",
         ]
         
         for line in preview_lines:
@@ -462,6 +467,7 @@ def process_video_interactive(
                 continue
             if key == ord("s"):
                 is_playing = False  # 按下S时停止自动播放
+                total_start = time.perf_counter()
                 
                 # 保存 current 帧，用于下方预览面板显示。
                 saved_current_frame = frame.copy()
@@ -471,6 +477,7 @@ def process_video_interactive(
                     unsharp_amount=args.deblur_unsharp,
                     unsharp_sigma=getattr(args, "deblur_sigma", 1.2),
                 )
+                select_start = time.perf_counter()
                 (
                     selected_frame,
                     selected_frame_index,
@@ -486,6 +493,7 @@ def process_video_interactive(
                     temporal_radius=getattr(args, "temporal_radius", 6),
                     temporal_stride=getattr(args, "temporal_stride", 1),
                 )
+                select_elapsed_sec = time.perf_counter() - select_start
 
                 # 文件名前缀包含保存序号、current 帧号和 selected 帧号。
                 frame_sample_id = (
@@ -515,6 +523,9 @@ def process_video_interactive(
                 deblur_blur_score = blur_laplacian_var(deblur_frame)
                 last_selected_blur_score = selected_blur_score
                 last_deblur_blur_score = deblur_blur_score
+                total_elapsed_sec = time.perf_counter() - total_start
+                last_select_elapsed_sec = select_elapsed_sec
+                last_total_elapsed_sec = total_elapsed_sec
                 record = DeblurSelectionRecord(
                     sample_id=frame_sample_id,
                     source_path=str(input_path),
@@ -537,6 +548,8 @@ def process_video_interactive(
                     selected_offset=selected_offset,
                     temporal_radius=getattr(args, "temporal_radius", None),
                     temporal_stride=getattr(args, "temporal_stride", None),
+                    select_elapsed_sec=select_elapsed_sec,
+                    total_elapsed_sec=total_elapsed_sec,
                 )
                 write_deblur_selection_metadata(metadata_path, record)
                 saved_records.append(record)
@@ -555,6 +568,8 @@ def process_video_interactive(
                     f"current_blur_score={current_blur_score:.2f}, "
                     f"selected_blur_score={selected_blur_score:.2f}, "
                     f"deblur_blur_score={deblur_blur_score:.2f}, "
+                    f"select_elapsed_ms={select_elapsed_sec * 1000.0:.1f}, "
+                    f"total_elapsed_ms={total_elapsed_sec * 1000.0:.1f}, "
                     f"output_prefix={frame_sample_id}"
                 )
                 continue
